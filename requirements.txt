@@ -1,0 +1,40 @@
+# Core Framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+
+# Async Task Queue
+celery[redis]==5.5.2
+redis==5.3.0
+
+# PostgreSQL ORM (SQLModel wraps SQLAlchemy + Pydantic)
+sqlmodel==0.0.24
+sqlalchemy[asyncio]==2.0.41
+asyncpg==0.30.0
+psycopg[binary]
+
+# MongoDB (async driver)
+motor==3.7.1
+
+# Platform API Clients
+google-api-python-client==2.172.0
+praw==8.0.1
+
+# Configuration & Environment
+pydantic-settings==2.9.1
+python-dotenv==1.1.0
+
+# Utilities
+httpx==0.28.1
+
+# Machine Learning & NLP
+transformers>=4.40.0
+torch
+nltk>=3.8.1
+xgboost>=2.0.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+vaderSentiment>=3.3.2
+joblib>=1.3.0
+
+# LLM / Chatbot
+openai>=1.30.0

@@ -1,0 +1,155 @@
+# =============================================================================
+#  EngageIQ — Docker Compose Orchestration
+#  Services: postgres-db | redis-broker | web-backend | celery-worker | web-frontend
+#  MongoDB: uses Atlas cloud URI from .env (no local container needed)
+# =============================================================================
+
+name: engageiq
+
+# ─── Shared environment variable defaults ────────────────────────────────────
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  DEBUG: ${DEBUG:-true}
+  # PostgreSQL
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  POSTGRES_HOST: postgres-db          # service name — Docker DNS resolves this
+  POSTGRES_PORT: 5432
+  POSTGRES_DB: ${POSTGRES_DB:-postgres}
+  # MongoDB (Atlas cloud — passed through from host .env)
+  MONGO_URI: ${MONGO_URI}
+  MONGO_DB: ${MONGO_DB:-engagement_raw}
+  # Redis / Celery
+  REDIS_URL: redis://redis-broker:6379/0
+  CELERY_BROKER_URL: redis://redis-broker:6379/1
+  CELERY_RESULT_BACKEND: redis://redis-broker:6379/2
+  # API Keys
+  YOUTUBE_API_KEY: ${YOUTUBE_API_KEY}
+  REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID}
+  REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET}
+  REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-EngageLens/3.0}
+  GROK_API_KEY: ${GROK_API_KEY}
+
+# ─── Named Volumes ────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# ─── Network ──────────────────────────────────────────────────────────────────
+networks:
+  engageiq-net:
+    driver: bridge
+
+# ─── Services ─────────────────────────────────────────────────────────────────
+services:
+
+  # ── 1. PostgreSQL Database ──────────────────────────────────────────────────
+  postgres-db:
+    image: postgres:17-alpine
+    container_name: engageiq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"          # expose to host so DBngin / psql tools can connect
+    networks:
+      - engageiq-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── 2. Redis Broker ─────────────────────────────────────────────────────────
+  redis-broker:
+    image: redis:7-alpine
+    container_name: engageiq-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"          # expose to host for local Celery worker testing
+    networks:
+      - engageiq-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 3. FastAPI Backend (Uvicorn) ─────────────────────────────────────────────
+  web-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: engageiq-backend
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+    ports:
+      - "8000:8000"
+    networks:
+      - engageiq-net
+    depends_on:
+      postgres-db:
+        condition: service_healthy
+      redis-broker:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ── 4. Celery Worker ────────────────────────────────────────────────────────
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: engageiq-celery
+    restart: unless-stopped
+    # Override the default uvicorn CMD with celery worker
+    command: >
+      celery -A app.core.celery_app worker
+             --loglevel=info
+             --concurrency=4
+             -Q celery,youtube,reddit
+    environment:
+      <<: *backend-env
+    networks:
+      - engageiq-net
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+      postgres-db:
+        condition: service_healthy
+
+  # ── 5. Vite Frontend ────────────────────────────────────────────────────────
+  web-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: engageiq-frontend
+    restart: unless-stopped
+    environment:
+      # Vite uses VITE_ prefix for client-side vars; none needed here
+      # The proxy in vite.config.js forwards /api → web-backend:8000
+      VITE_API_BASE: http://web-backend:8000
+    ports:
+      - "5173:5173"
+    networks:
+      - engageiq-net
+    depends_on:
+      web-backend:
+        condition: service_healthy

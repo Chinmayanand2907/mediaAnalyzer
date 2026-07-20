@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Git & IDE
+.git/
+.gitignore
+.DS_Store
+*.swp
+*.swo
+
+# Docs / tests (not needed in image)
+tests/
+*.md
+
+# Local secrets (injected via env in compose)
+.env
