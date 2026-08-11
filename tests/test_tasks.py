@@ -24,12 +24,15 @@ def mock_db(mocker):
     return mock_session_instance
 
 @pytest.mark.asyncio
-async def test_ingest_youtube_data_async(mock_db):
+async def test_ingest_youtube_data_async(mock_db, mocker):
     """Test the async logic of YouTube ingestion."""
-    # Run the async function directly to avoid asyncio.run() loop conflicts in tests
+    mocker.patch("app.tasks.ingestion_tasks.asyncio.to_thread", side_effect=[
+        {"id": "test_channel", "snippet": {"title": "Test YT Channel"}, "statistics": {"subscriberCount": 100}}, # _fetch_channel_info
+        [], # _fetch_channel_videos
+        []  # _fetch_video_comments
+    ])
     await _ingest_youtube_data_async("test_channel")
     
-    # Assert session executed and committed
     assert mock_db.execute.called
     assert mock_db.commit.called
 
@@ -37,18 +40,21 @@ def test_tasks_ingest_youtube_data(mocker, mock_db):
     """Test the celery task wrapper."""
     mock_asyncio_run = mocker.patch("app.tasks.ingestion_tasks.asyncio.run")
     
-    # We mock out the self argument of Celery task since bind=True
     result = tasks_ingest_youtube_data(channel_id="test_channel")
     
     assert result == "Successfully ingested YouTube data for test_channel"
     assert mock_asyncio_run.called
 
 @pytest.mark.asyncio
-async def test_ingest_reddit_data_async(mock_db):
+async def test_ingest_reddit_data_async(mock_db, mocker):
     """Test the async logic of Reddit ingestion."""
+    mocker.patch("app.tasks.ingestion_tasks.asyncio.to_thread", side_effect=[
+        {"id": "test_subreddit", "title": "Test Subreddit", "subscribers": 100, "public_description": "desc"}, # _fetch_sub_info
+        [], # _fetch_recent_posts
+        []  # _fetch_comments_for_posts
+    ])
     await _ingest_reddit_data_async("test_subreddit")
     
-    # Assert session executed and committed
     assert mock_db.execute.called
     assert mock_db.commit.called
 
@@ -57,6 +63,7 @@ def test_tasks_ingest_reddit_data(mocker, mock_db):
     mock_asyncio_run = mocker.patch("app.tasks.ingestion_tasks.asyncio.run")
     
     result = tasks_ingest_reddit_data(subreddit_name="test_subreddit")
+
     
     assert result == "Successfully ingested Reddit data for test_subreddit"
     assert mock_asyncio_run.called

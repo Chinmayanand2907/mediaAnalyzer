@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Users, Hash, MessageSquare, Flame, RefreshCw, Layers } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Users, Hash, MessageSquare, Flame, RefreshCw, Layers, PlusCircle } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip, Cell, YAxis } from 'recharts';
 
 import { useAnalytics } from '../hooks/useAnalytics';
@@ -41,54 +41,95 @@ const KeywordTooltip = ({ active, payload }) => {
 
 export default function RedditView() {
   const [selectedSub, setSelectedSub]     = useState(null);
+  const [newSubInput, setNewSubInput]     = useState('');
+  const [inputMode, setInputMode]         = useState(false);
   const [page, setPage]                   = useState(1);
   const [sentFilter, setSentFilter]       = useState(null);
   const [ingestMsg, setIngestMsg]         = useState('');
+  const [ingestLoading, setIngestLoading] = useState(false);
 
   // ── Subreddit list ───────────────────────────────────────────────────────
-  const { data: subreddits, loading: listLoading } = useAnalytics(
+  const { data: subreddits, loading: listLoading, refetch: refetchSubreddits } = useAnalytics(
     (signal) => fetchRedditSubreddits(signal),
     []
   );
 
   // ── Metrics ──────────────────────────────────────────────────────────────
-  const { data: metrics, loading: metricsLoading } = useAnalytics(
+  const { data: metrics, loading: metricsLoading, refetch: refetchMetrics } = useAnalytics(
     (signal) => fetchRedditSubreddit(selectedSub, signal),
     [selectedSub],
     { enabled: !!selectedSub }
   );
 
   // ── Sentiment ────────────────────────────────────────────────────────────
-  const { data: sentiment, loading: sentLoading } = useAnalytics(
+  const { data: sentiment, loading: sentLoading, refetch: refetchSentiment } = useAnalytics(
     (signal) => fetchRedditSentiment(selectedSub, 200, signal),
     [selectedSub],
     { enabled: !!selectedSub }
   );
 
   // ── Keywords ─────────────────────────────────────────────────────────────
-  const { data: keywords, loading: kwLoading } = useAnalytics(
+  const { data: keywords, loading: kwLoading, refetch: refetchKeywords } = useAnalytics(
     (signal) => fetchRedditKeywords(selectedSub, 300, 15, signal),
     [selectedSub],
     { enabled: !!selectedSub }
   );
 
   // ── Comments ─────────────────────────────────────────────────────────────
-  const { data: comments, loading: commentsLoading } = useAnalytics(
+  const { data: comments, loading: commentsLoading, refetch: refetchComments } = useAnalytics(
     (signal) => fetchRedditComments(selectedSub, page, 20, sentFilter, signal),
     [selectedSub, page, sentFilter],
     { enabled: !!selectedSub }
   );
 
-  const handleIngest = async () => {
-    if (!selectedSub) return;
-    setIngestMsg('Queuing ingestion…');
+  // Auto-select the first subreddit when data loads if none is selected
+  useEffect(() => {
+    if (!selectedSub && subreddits && subreddits.length > 0) {
+      setSelectedSub(subreddits[0].platform_id);
+    }
+  }, [subreddits, selectedSub]);
+
+  const handleIngest = async (subName) => {
+    const target = subName || selectedSub;
+    if (!target) return;
+    setIngestLoading(true);
+    setIngestMsg('⏳ Queuing ingestion task...');
     try {
-      const res = await triggerRedditIngest(selectedSub);
-      setIngestMsg(`✅ ${res.message}`);
+      const res = await triggerRedditIngest(target);
+      setIngestMsg(`⏳ Ingestion started: ${res.message} — Updating metrics...`);
+
+      const isNewSub = !selectedSub || selectedSub !== target;
+      if (isNewSub) {
+        setTimeout(() => {
+          setSelectedSub(target);
+          setNewSubInput('');
+          setInputMode(false);
+          setPage(1);
+          setSentFilter(null);
+        }, 1500);
+      }
+
+      // Poll multiple times because Celery tasks can take 10+ seconds
+      let pollCount = 0;
+      const intervalId = setInterval(() => {
+        pollCount += 1;
+        refetchSubreddits();
+        refetchMetrics();
+        refetchSentiment();
+        refetchKeywords();
+        refetchComments();
+        
+        if (pollCount >= 4) {
+          clearInterval(intervalId);
+          setIngestMsg('✅ Ingestion complete! Latest data & subreddit timestamp loaded.');
+          setIngestLoading(false);
+        }
+      }, 3500);
     } catch (e) {
       setIngestMsg(`❌ ${e.message}`);
+      setIngestLoading(false);
     }
-    setTimeout(() => setIngestMsg(''), 6000);
+    setTimeout(() => setIngestMsg(''), 15000);
   };
 
   return (
@@ -107,45 +148,116 @@ export default function RedditView() {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           {/* Subreddit selector */}
-          <div style={{ position: 'relative' }}>
-            <select
-              className="platform-select"
-              value={selectedSub ?? ''}
-              onChange={(e) => { setSelectedSub(e.target.value || null); setPage(1); setSentFilter(null); }}
-              style={{ minWidth: 200 }}
-            >
-              <option value="">— Select a subreddit —</option>
-              {(subreddits ?? []).map((sub) => (
-                <option key={sub.subreddit_name} value={sub.subreddit_name}>
-                  r/{sub.subreddit_name}
-                </option>
-              ))}
-            </select>
-            {listLoading && (
-              <span style={{ position: 'absolute', right: 36, top: '50%', transform: 'translateY(-50%)', fontSize: 11, color: 'var(--text-muted)' }}>
-                Loading…
-              </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {!inputMode ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ position: 'relative' }}>
+                  <select
+                    className="platform-select"
+                    value={selectedSub ?? ''}
+                    onChange={(e) => { setSelectedSub(e.target.value || null); setPage(1); setSentFilter(null); }}
+                    style={{ minWidth: 200 }}
+                  >
+                    <option value="">— Select a subreddit —</option>
+                    {(subreddits ?? []).map((sub) => (
+                      <option key={sub.subreddit_name} value={sub.subreddit_name}>
+                        r/{sub.subreddit_name}
+                      </option>
+                    ))}
+                  </select>
+                  {listLoading && (
+                    <span style={{ position: 'absolute', right: 36, top: '50%', transform: 'translateY(-50%)', fontSize: 11, color: 'var(--text-muted)' }}>
+                      Loading…
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={() => setInputMode(true)}
+                  title="Add a new subreddit"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    padding: '7px 12px', borderRadius: 10,
+                    background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-muted)', fontSize: 12, fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <PlusCircle size={13} /> Add new
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{
+                  display: 'flex', alignItems: 'center',
+                  background: 'rgba(255,255,255,0.06)',
+                  border: '1px solid rgba(244,63,94,0.45)',
+                  borderRadius: 10, overflow: 'hidden',
+                }}>
+                  <span style={{ padding: '0 10px', color: 'var(--text-muted)', fontSize: 13, fontWeight: 700, borderRight: '1px solid rgba(244,63,94,0.3)' }}>r/</span>
+                  <input
+                    type="text"
+                    autoFocus
+                    placeholder="subreddit name"
+                    value={newSubInput}
+                    onChange={(e) => setNewSubInput(e.target.value.replace(/^r\//, '').replace(/\s/g, ''))}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && newSubInput.trim()) handleIngest(newSubInput.trim()); if (e.key === 'Escape') setInputMode(false); }}
+                    style={{
+                      padding: '8px 12px', minWidth: 200,
+                      background: 'transparent',
+                      border: 'none', color: 'var(--text-primary)', fontSize: 13,
+                      outline: 'none',
+                    }}
+                  />
+                </div>
+                <button
+                  onClick={() => { if (newSubInput.trim()) handleIngest(newSubInput.trim()); }}
+                  disabled={!newSubInput.trim() || ingestLoading}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    padding: '8px 14px', borderRadius: 10,
+                    background: newSubInput.trim() ? 'rgba(244,63,94,0.2)' : 'rgba(255,255,255,0.04)',
+                    border: `1px solid ${newSubInput.trim() ? 'rgba(244,63,94,0.5)' : 'var(--border)'}`,
+                    color: newSubInput.trim() ? 'var(--rd-primary)' : 'var(--text-muted)',
+                    fontSize: 13, fontWeight: 600, cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <PlusCircle size={13} /> Ingest
+                </button>
+                <button
+                  onClick={() => { setInputMode(false); setNewSubInput(''); }}
+                  style={{
+                    padding: '7px 10px', borderRadius: 10,
+                    background: 'transparent', border: '1px solid var(--border)',
+                    color: 'var(--text-muted)', fontSize: 12, cursor: 'pointer',
+                  }}
+                >✕</button>
+              </div>
             )}
           </div>
 
-          {/* Ingest button */}
-          <button
-            onClick={handleIngest}
-            disabled={!selectedSub}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: '8px 14px', borderRadius: 10,
-              background: selectedSub ? 'rgba(244,63,94,0.15)' : 'rgba(255,255,255,0.04)',
-              border: `1px solid ${selectedSub ? 'rgba(244,63,94,0.4)' : 'var(--border)'}`,
-              color: selectedSub ? 'var(--rd-primary)' : 'var(--text-muted)',
-              fontSize: 13, fontWeight: 600,
-              cursor: selectedSub ? 'pointer' : 'not-allowed',
-              transition: 'all 0.2s',
-            }}
-          >
-            <RefreshCw size={14} />
-            Re-ingest
-          </button>
+          {/* Ingest button — only in dropdown mode */}
+          {!inputMode && (
+            <button
+              onClick={() => handleIngest(null)}
+              disabled={!selectedSub || ingestLoading}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '8px 14px', borderRadius: 10,
+                background: selectedSub ? 'rgba(244,63,94,0.15)' : 'rgba(255,255,255,0.04)',
+                border: `1px solid ${selectedSub ? 'rgba(244,63,94,0.4)' : 'var(--border)'}`,
+                color: selectedSub ? 'var(--rd-primary)' : 'var(--text-muted)',
+                fontSize: 13, fontWeight: 600,
+                cursor: selectedSub ? 'pointer' : 'not-allowed',
+                transition: 'all 0.2s',
+              }}
+            >
+              <RefreshCw size={14} style={{ animation: ingestLoading ? 'spin 1s linear infinite' : 'none' }} />
+              Re-ingest
+            </button>
+          )}
         </div>
       </div>
 

@@ -15,16 +15,15 @@ import json
 import uuid
 from datetime import datetime, timezone
 
+import certifi
 from celery import shared_task
 from celery.utils.log import get_task_logger
+from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from sqlalchemy import select
 
-from app.db.mongodb import (
-    connect_mongo,
-    close_mongo,
-    get_video_payloads_collection,
-    get_comments_collection,
-)
+
+from app.core.config import get_settings
 from app.db.postgres import (
     AsyncSessionLocal,
     PlatformAccount,
@@ -32,175 +31,365 @@ from app.db.postgres import (
 )
 
 logger = get_task_logger(__name__)
+settings = get_settings()
+
+# ─── Motor Client Factory ────────────────────────────────────────────────────
+
+def _make_motor_client() -> AsyncIOMotorClient:
+    """
+    Create a *task-local* Motor client bound to the current event loop.
+
+    Each Celery task calls ``asyncio.run()``, which creates a brand-new
+    event loop.  Motor's connection pool is tied to the loop it was created
+    on, so we must never reuse a client across ``asyncio.run()`` boundaries.
+    This factory is called at the top of every async helper and the returned
+    client is closed in the corresponding ``finally`` block before
+    ``asyncio.run()`` tears down the loop.
+    """
+    return AsyncIOMotorClient(
+        settings.MONGO_URI,
+        maxPoolSize=10,               # modest pool — this client is short-lived
+        minPoolSize=0,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        tlsCAFile=certifi.where(),
+    )
 
 
 # ─── Async Helpers ──────────────────────────────────────────────────────────
 
 async def _ingest_youtube_data_async(channel_id: str) -> None:
-    """Async implementation of YouTube data ingestion."""
-    # Connect to MongoDB for this task execution
-    await connect_mongo()
+    """Async implementation of YouTube data ingestion using the real YouTube Data API v3."""
+    from app.services.external.youtube_client import YouTubeClient, YouTubeAPIError
+
+    client = _make_motor_client()
     try:
-        # 1. Fetch data using external clients (Placeholder)
-        logger.info(f"Fetching YouTube data for channel {channel_id} (Placeholder)")
-        # mock_data = await youtube_client.get_channel_data(channel_id)
-        mock_payload = {
-            "platform": "youtube",
-            "platform_id": channel_id,
-            "title": f"Mock Channel {channel_id}",
-            "stats": {"views": 1000, "likes": 50},
-            "raw": {"description": "Sample description"},
-            "ingested_at": datetime.now(timezone.utc)
-        }
-        mock_comments = [
-            {
-                "platform": "youtube",
-                "platform_id": f"comment_{channel_id}_{i}",
-                "parent_id": channel_id,
-                "author": f"user{i}",
-                "body": f"This is comment {i}",
-                "published_at": datetime.now(timezone.utc).isoformat(),
-                "raw": {},
-                "ingested_at": datetime.now(timezone.utc)
-            } for i in range(5)
-        ]
+        db = client[settings.MONGO_DB]
+        comments_coll  = db["comments"]
+        payloads_coll  = db["video_payloads"]
 
-        # 2. Store raw text in MongoDB
-        logger.info(f"Storing raw YouTube data in MongoDB for {channel_id}")
-        payloads_coll = get_video_payloads_collection()
-        comments_coll = get_comments_collection()
-        
-        await payloads_coll.update_one(
-            {"platform": "youtube", "platform_id": channel_id},
-            {"$set": mock_payload},
-            upsert=True
-        )
-        if mock_comments:
-            # Upsert comments to avoid duplicates on re-run
-            for comment in mock_comments:
-                await comments_coll.update_one(
-                    {"platform": "youtube", "platform_id": comment["platform_id"]},
-                    {"$set": comment},
-                    upsert=True
+        clean_input = channel_id.strip()
+        logger.info(f"Fetching real YouTube data for channel input '{clean_input}'")
+        yt = YouTubeClient()
+
+        # ── 1. Fetch channel metadata with multi-strategy resolution ──────
+        def _fetch_channel_info():
+            # Strategy A: Direct Channel ID lookup
+            req = yt._service.channels().list(
+                part="snippet,statistics,brandingSettings",
+                id=clean_input,
+            )
+            res = req.execute()
+            items = res.get("items", [])
+            if items:
+                return items[0]
+
+            # Strategy B: Handle lookup (e.g. @mkbhd)
+            handle = clean_input if clean_input.startswith("@") else f"@{clean_input}"
+            try:
+                req = yt._service.channels().list(
+                    part="snippet,statistics,brandingSettings",
+                    forHandle=handle,
                 )
+                res = req.execute()
+                items = res.get("items", [])
+                if items:
+                    return items[0]
+            except Exception as e:
+                logger.debug(f"Handle lookup failed: {e}")
 
-        # 3. Save structured metadata metrics to PostgreSQL
-        logger.info(f"Saving structured YouTube metrics to Postgres for {channel_id}")
+            # Strategy C: Username lookup
+            try:
+                req = yt._service.channels().list(
+                    part="snippet,statistics,brandingSettings",
+                    forUsername=clean_input,
+                )
+                res = req.execute()
+                items = res.get("items", [])
+                if items:
+                    return items[0]
+            except Exception as e:
+                logger.debug(f"Username lookup failed: {e}")
+
+            # Strategy D: Search channel by query
+            try:
+                s_req = yt._service.search().list(
+                    part="snippet",
+                    q=clean_input,
+                    type="channel",
+                    maxResults=1,
+                )
+                s_res = s_req.execute()
+                s_items = s_res.get("items", [])
+                if s_items:
+                    found_id = (
+                        s_items[0].get("snippet", {}).get("channelId")
+                        or s_items[0].get("id", {}).get("channelId")
+                    )
+                    if found_id:
+                        req = yt._service.channels().list(
+                            part="snippet,statistics,brandingSettings",
+                            id=found_id,
+                        )
+                        res = req.execute()
+                        items = res.get("items", [])
+                        if items:
+                            return items[0]
+            except Exception as e:
+                logger.debug(f"Search lookup failed: {e}")
+
+            return None
+
+        ch = await asyncio.to_thread(_fetch_channel_info)
+        if not ch:
+            raise ValueError(f"YouTube channel '{clean_input}' not found via API.")
+
+        canonical_channel_id = ch.get("id", clean_input)
+        snippet = ch.get("snippet", {})
+        stats   = ch.get("statistics", {})
+        thumbnails = snippet.get("thumbnails", {})
+        thumb_url = (
+            thumbnails.get("high", {}).get("url")
+            or thumbnails.get("medium", {}).get("url")
+            or thumbnails.get("default", {}).get("url")
+        )
+
+        display_name     = snippet.get("title", canonical_channel_id)
+        description      = snippet.get("description", "")
+        subscriber_count = int(stats.get("subscriberCount", 0))
+        view_count       = int(stats.get("viewCount", 0))
+        video_count      = int(stats.get("videoCount", 0))
+
+        # ── 2. Fetch recent videos ────────────────────────────────────────
+        logger.info(f"Fetching recent videos for channel {canonical_channel_id}")
+        try:
+            videos_resp = await yt.fetch_channel_videos(canonical_channel_id, max_results=10)
+            video_ids = [v.video_id for v in videos_resp.videos if v.video_id]
+        except YouTubeAPIError as e:
+            logger.warning(f"Could not fetch videos for {canonical_channel_id}: {e}")
+            video_ids = []
+
+        # ── 3. Fetch comments from recent videos ──────────────────────────
+        logger.info(f"Fetching comments for {len(video_ids)} videos from channel {canonical_channel_id}")
+        total_likes = 0
+
+        for vid_id in video_ids[:5]:  # limit to 5 videos to save API quota
+            try:
+                threads_resp = await yt.fetch_comment_threads(vid_id, max_results=50)
+                for thread in threads_resp.threads:
+                    top = thread.top_comment
+                    total_likes += top.like_count
+                    comment_doc = {
+                        "platform":     "youtube",
+                        "platform_id":  top.comment_id,
+                        "parent_id":    canonical_channel_id,
+                        "video_id":     vid_id,
+                        "author":       top.author_name,
+                        "body":         top.text,
+                        "like_count":   top.like_count,
+                        "published_at": top.published_at,
+                        "raw":          {},
+                        "ingested_at":  datetime.now(timezone.utc),
+                    }
+                    await comments_coll.update_one(
+                        {"platform": "youtube", "platform_id": top.comment_id},
+                        {"$set": comment_doc},
+                        upsert=True,
+                    )
+            except YouTubeAPIError as e:
+                logger.warning(f"Skipping comments for video {vid_id}: {e}")
+                continue
+
+        # ── 4. Store channel payload in MongoDB ───────────────────────────
+        logger.info(f"Storing YouTube payload in MongoDB for {canonical_channel_id}")
+        payload_doc = {
+            "platform":    "youtube",
+            "platform_id": canonical_channel_id,
+            "title":       display_name,
+            "stats": {
+                "views":       view_count,
+                "likes":       total_likes,
+                "video_count": video_count,
+            },
+            "raw": {"description": description},
+            "ingested_at": datetime.now(timezone.utc),
+        }
+        await payloads_coll.update_one(
+            {"platform": "youtube", "platform_id": canonical_channel_id},
+            {"$set": payload_doc},
+            upsert=True,
+        )
+
+        # ── 5. Upsert channel record in PostgreSQL ────────────────────────
+        logger.info(f"Saving YouTube channel metrics to Postgres for {canonical_channel_id}")
         async with AsyncSessionLocal() as session:
             stmt = select(PlatformAccount).where(
                 PlatformAccount.platform == Platform.YOUTUBE,
-                PlatformAccount.platform_id == channel_id
+                PlatformAccount.platform_id == canonical_channel_id,
             )
-            result = await session.execute(stmt)
+            result  = await session.execute(stmt)
             account = result.scalar_one_or_none()
-            
+
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
             if not account:
                 account = PlatformAccount(
                     id=uuid.uuid4(),
                     platform=Platform.YOUTUBE,
-                    platform_id=channel_id,
-                    display_name=mock_payload["title"],
-                    description=mock_payload["raw"].get("description"),
-                    subscriber_count=1000, # Mock
+                    platform_id=canonical_channel_id,
+                    display_name=display_name,
+                    description=description,
+                    subscriber_count=subscriber_count,
+                    profile_image_url=thumb_url,
+                    updated_at=now_utc,
                 )
                 session.add(account)
             else:
-                account.display_name = mock_payload["title"]
-                account.subscriber_count = 1000
-                account.description = mock_payload["raw"].get("description")
-                
+                account.display_name    = display_name
+                account.description     = description
+                account.subscriber_count = subscriber_count
+                account.profile_image_url = thumb_url
+                account.updated_at      = now_utc
+
             await session.commit()
 
-        # 4. Kick off NLP sentiment analysis for this channel
-        logger.info(f"Dispatching sentiment analysis task for YouTube channel {channel_id}")
-        task_process_sentiment.delay("youtube", channel_id)
+        # ── 6. Kick off sentiment analysis ────────────────────────────────
+        logger.info(f"Dispatching sentiment task for YouTube channel {canonical_channel_id}")
+        from app.core.celery_app import celery_app
+        celery_app.send_task("app.tasks.ingestion_tasks.task_process_sentiment", args=["youtube", canonical_channel_id])
 
     finally:
-        # Always close the MongoDB connection when done
-        await close_mongo()
+        client.close()
 
 
 async def _ingest_reddit_data_async(subreddit_name: str) -> None:
-    """Async implementation of Reddit data ingestion."""
-    # Connect to MongoDB for this task execution
-    await connect_mongo()
+    """Async implementation of Reddit data ingestion using the real PRAW client."""
+    from app.services.external.reddit_client import RedditClient, RedditClientError
+
+    client = _make_motor_client()
     try:
-        # 1. Fetch data using external clients (Placeholder)
-        logger.info(f"Fetching Reddit data for subreddit {subreddit_name} (Placeholder)")
-        # mock_data = await reddit_client.get_subreddit_data(subreddit_name)
-        mock_payload = {
-            "platform": "reddit",
-            "platform_id": subreddit_name,
-            "title": f"r/{subreddit_name}",
-            "stats": {"members": 50000},
-            "raw": {"description": "A great subreddit"},
-            "ingested_at": datetime.now(timezone.utc)
-        }
-        mock_comments = [
-            {
-                "platform": "reddit",
-                "platform_id": f"comment_{subreddit_name}_{i}",
-                "parent_id": subreddit_name,
-                "author": f"user{i}",
-                "body": f"This is comment {i}",
-                "published_at": datetime.now(timezone.utc).isoformat(),
-                "raw": {},
-                "ingested_at": datetime.now(timezone.utc)
-            } for i in range(5)
-        ]
+        db = client[settings.MONGO_DB]
+        comments_coll = db["comments"]
+        payloads_coll = db["video_payloads"]
 
-        # 2. Store raw text in MongoDB
-        logger.info(f"Storing raw Reddit data in MongoDB for {subreddit_name}")
-        payloads_coll = get_video_payloads_collection()
-        comments_coll = get_comments_collection()
-        
-        await payloads_coll.update_one(
-            {"platform": "reddit", "platform_id": subreddit_name},
-            {"$set": mock_payload},
-            upsert=True
-        )
-        if mock_comments:
-            for comment in mock_comments:
-                await comments_coll.update_one(
-                    {"platform": "reddit", "platform_id": comment["platform_id"]},
-                    {"$set": comment},
-                    upsert=True
+        clean_sub = subreddit_name.strip().lstrip('/').replace('r/', '').replace('/r/', '').strip().lower()
+        logger.info(f"Fetching real Reddit data for r/{clean_sub}")
+        reddit = RedditClient()
+
+        # ── 1. Fetch subreddit metadata ───────────────────────────────────
+        def _fetch_sub_info():
+            sub = reddit._reddit.subreddit(clean_sub)
+            return {
+                "display_name":   sub.display_name,
+                "title":          sub.title,
+                "description":    sub.public_description or sub.description or "",
+                "subscriber_count": sub.subscribers,
+                "over18":         sub.over18,
+            }
+
+        sub_info = await asyncio.to_thread(_fetch_sub_info)
+
+        display_name     = sub_info["title"] or f"r/{clean_sub}"
+        description      = sub_info["description"]
+        subscriber_count = sub_info["subscriber_count"] or 0
+
+        # ── 2. Fetch hot threads ──────────────────────────────────────────
+        logger.info(f"Fetching hot threads for r/{clean_sub}")
+        try:
+            hot_resp = await reddit.fetch_hot_threads(clean_sub, limit=10)
+            threads  = hot_resp.threads
+        except RedditClientError as e:
+            logger.warning(f"Could not fetch threads for r/{clean_sub}: {e}")
+            threads = []
+
+        # ── 3. Fetch comments from each hot thread ────────────────────────
+        logger.info(f"Fetching comments from {len(threads)} hot threads in r/{clean_sub}")
+
+        for thread in threads[:5]:  # limit to 5 posts
+            try:
+                comments_resp = await reddit.fetch_top_comments(
+                    thread.post_id, limit=30, include_replies=False
                 )
+                for comment in comments_resp.comments:
+                    if not comment.body or comment.body in ("[deleted]", "[removed]"):
+                        continue
+                    comment_doc = {
+                        "platform":     "reddit",
+                        "platform_id":  comment.comment_id,
+                        "parent_id":    clean_sub,
+                        "post_id":      thread.post_id,
+                        "author":       comment.author,
+                        "body":         comment.body,
+                        "score":        comment.score,
+                        "published_at": datetime.fromtimestamp(
+                            comment.created_utc, tz=timezone.utc
+                        ).isoformat() if comment.created_utc else None,
+                        "permalink":    comment.permalink,
+                        "raw":          {},
+                        "ingested_at":  datetime.now(timezone.utc),
+                    }
+                    await comments_coll.update_one(
+                        {"platform": "reddit", "platform_id": comment.comment_id},
+                        {"$set": comment_doc},
+                        upsert=True,
+                    )
+            except RedditClientError as e:
+                logger.warning(f"Skipping comments for post {thread.post_id}: {e}")
+                continue
 
-        # 3. Save structured metadata metrics to PostgreSQL
-        logger.info(f"Saving structured Reddit metrics to Postgres for {subreddit_name}")
+        # ── 4. Store subreddit payload in MongoDB ─────────────────────────
+        logger.info(f"Storing Reddit payload in MongoDB for r/{clean_sub}")
+        payload_doc = {
+            "platform":    "reddit",
+            "platform_id": clean_sub,
+            "title":       display_name,
+            "stats":       {"members": subscriber_count},
+            "raw":         {"description": description},
+            "ingested_at": datetime.now(timezone.utc),
+        }
+        await payloads_coll.update_one(
+            {"platform": "reddit", "platform_id": clean_sub},
+            {"$set": payload_doc},
+            upsert=True,
+        )
+
+        # ── 5. Upsert subreddit record in PostgreSQL ──────────────────────
+        logger.info(f"Saving Reddit metrics to Postgres for r/{clean_sub}")
         async with AsyncSessionLocal() as session:
             stmt = select(PlatformAccount).where(
                 PlatformAccount.platform == Platform.REDDIT,
-                PlatformAccount.platform_id == subreddit_name
+                PlatformAccount.platform_id == clean_sub,
             )
-            result = await session.execute(stmt)
+            result  = await session.execute(stmt)
             account = result.scalar_one_or_none()
-            
+
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
             if not account:
                 account = PlatformAccount(
                     id=uuid.uuid4(),
                     platform=Platform.REDDIT,
-                    platform_id=subreddit_name,
-                    display_name=mock_payload["title"],
-                    description=mock_payload["raw"].get("description"),
-                    subscriber_count=50000, # Mock
+                    platform_id=clean_sub,
+                    display_name=display_name,
+                    description=description,
+                    subscriber_count=subscriber_count,
+                    updated_at=now_utc,
                 )
                 session.add(account)
             else:
-                account.display_name = mock_payload["title"]
-                account.subscriber_count = 50000
-                account.description = mock_payload["raw"].get("description")
-                
+                account.display_name     = display_name
+                account.description      = description
+                account.subscriber_count = subscriber_count
+                account.updated_at       = now_utc
+
             await session.commit()
 
-        # 4. Kick off NLP sentiment analysis for this subreddit
-        logger.info(f"Dispatching sentiment analysis task for subreddit {subreddit_name}")
-        task_process_sentiment.delay("reddit", subreddit_name)
+        # ── 6. Kick off sentiment analysis ────────────────────────────────
+        logger.info(f"Dispatching sentiment task for r/{clean_sub}")
+        from app.core.celery_app import celery_app
+        celery_app.send_task("app.tasks.ingestion_tasks.task_process_sentiment", args=["reddit", clean_sub])
 
     finally:
-        # Always close the MongoDB connection when done
-        await close_mongo()
+        client.close()
+
 
 
 # ─── Sentiment Processing Helpers ───────────────────────────────────────────
@@ -244,44 +433,34 @@ def _vader_compound_to_category(compound: float) -> str:
 
 def _run_roberta_batch(texts: list[str]) -> list[str]:
     """
-    Run a list of texts through the globally cached RoBERTa pipeline.
-
-    Returns a list of canonical category strings ("positive" / "neutral" /
-    "negative") in the same order as the input.
+    Run texts through RoBERTa if the pipeline is pre-loaded, otherwise fall
+    back to VADER so sentiment analysis never crashes.
     """
-    # Import the module-level globals set by the worker_process_init signal.
-    from app.tasks.celery_app import _roberta_pipeline  # noqa: PLC0415
+    # Try the pre-loaded pipeline from the worker_process_init signal
+    try:
+        from app.core.celery_app import _roberta_pipeline  # noqa: PLC0415
+        if _roberta_pipeline is not None:
+            results = _roberta_pipeline(texts, batch_size=32)
+            return [_roberta_label_to_category(r["label"]) for r in results]
+    except Exception:
+        pass
 
-    if _roberta_pipeline is None:
-        raise RuntimeError(
-            "RoBERTa pipeline is not loaded. "
-            "Ensure worker_process_init has fired before calling this function."
-        )
-
-    # The pipeline accepts a list and returns a list of {label, score} dicts.
-    # batch_size=32 balances GPU utilisation vs. memory pressure.
-    results = _roberta_pipeline(texts, batch_size=32)
-    return [_roberta_label_to_category(r["label"]) for r in results]
+    # Fallback: use VADER directly (no pre-loading required)
+    logger.warning("[Sentiment] RoBERTa not available — falling back to VADER.")
+    return _run_vader_batch(texts)
 
 
 def _run_vader_batch(texts: list[str]) -> list[str]:
     """
-    Run a list of texts through the globally cached VADER analyzer.
-
-    Returns a list of canonical category strings in the same order as the
-    input.
+    Run texts through VADER. Instantiated on-demand so it works even when
+    worker_process_init hasn't pre-loaded a global analyzer.
     """
-    from app.tasks.celery_app import _vader_analyzer  # noqa: PLC0415
-
-    if _vader_analyzer is None:
-        raise RuntimeError(
-            "VADER analyzer is not loaded. "
-            "Ensure worker_process_init has fired before calling this function."
-        )
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # noqa: PLC0415
+    analyzer = SentimentIntensityAnalyzer()
 
     categories = []
     for text in texts:
-        scores = _vader_analyzer.polarity_scores(text)
+        scores = analyzer.polarity_scores(text)
         categories.append(_vader_compound_to_category(scores["compound"]))
     return categories
 
@@ -292,7 +471,7 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
 
     Steps
     -----
-    1. Connect to MongoDB.
+    1. Create a task-local Motor client (safe for this asyncio.run() loop).
     2. Fetch all comments for (platform, parent_id=target_id) that have not
        yet been sentiment-processed (``sentiment_processed`` field absent or
        False).
@@ -306,9 +485,10 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
     -------
     dict with keys: total, positive_pct, neutral_pct, negative_pct
     """
-    await connect_mongo()
+    client = _make_motor_client()
     try:
-        comments_coll = get_comments_collection()
+        db = client[settings.MONGO_DB]
+        comments_coll = db["comments"]
 
         # ── 1. Fetch unprocessed comments ────────────────────────────────────
         cursor = comments_coll.find(
@@ -340,12 +520,8 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
         texts = [d.get("body", "") or "" for d in docs]
 
         # ── 3. Run through NLP model ──────────────────────────────────────────
-        from app.tasks.celery_app import _use_vader  # noqa: PLC0415
-
-        if _use_vader:
-            categories = _run_vader_batch(texts)
-        else:
-            categories = _run_roberta_batch(texts)
+        # _run_roberta_batch auto-falls-back to VADER if RoBERTa isn't loaded
+        categories = _run_roberta_batch(texts)
 
         # ── 4. Tally counts and compute percentages ───────────────────────────
         total = len(categories)
@@ -353,26 +529,35 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
         for cat in categories:
             counts[cat] += 1
 
-        positive_pct = round(counts["positive"] / total * 100, 2)
-        neutral_pct  = round(counts["neutral"]  / total * 100, 2)
-        negative_pct = round(counts["negative"] / total * 100, 2)
+        positive_ratio = round(counts["positive"] / total, 4)
+        neutral_ratio  = round(counts["neutral"]  / total, 4)
+        negative_ratio = round(counts["negative"] / total, 4)
 
         logger.info(
             "[Sentiment] %s/%s → +%.1f%% / ~%.1f%% / -%.1f%%",
             platform, target_id,
-            positive_pct, neutral_pct, negative_pct,
+            positive_ratio * 100, neutral_ratio * 100, negative_ratio * 100,
         )
 
-        # ── 5. Bulk-mark processed comments in MongoDB ────────────────────────
-        await comments_coll.update_many(
-            {"_id": {"$in": doc_ids}},
-            {
-                "$set": {
-                    "sentiment_processed": True,
-                    "sentiment_processed_at": datetime.now(timezone.utc),
-                }
-            },
-        )
+        # ── 5. Bulk-mark processed comments in MongoDB ──────────────────────────
+        # Write sentiment_label per-document so routers can filter directly in
+        # MongoDB instead of having to fetch and filter in Python.
+        now_utc = datetime.now(timezone.utc)
+        bulk_ops = [
+            UpdateOne(
+                {"_id": doc_id},
+                {
+                    "$set": {
+                        "sentiment_processed": True,
+                        "sentiment_processed_at": now_utc,
+                        "sentiment_label": category,
+                    }
+                },
+            )
+            for doc_id, category in zip(doc_ids, categories)
+        ]
+        if bulk_ops:
+            await comments_coll.bulk_write(bulk_ops, ordered=False)
 
         # ── 6. Persist sentiment scores in PostgreSQL ─────────────────────────
         # Convert platform string to the Platform enum used by the ORM.
@@ -384,9 +569,9 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
             )
             return {
                 "total": total,
-                "positive_pct": positive_pct,
-                "neutral_pct": neutral_pct,
-                "negative_pct": negative_pct,
+                "positive_pct": positive_ratio,
+                "neutral_pct": neutral_ratio,
+                "negative_pct": negative_ratio,
             }
 
         async with AsyncSessionLocal() as session:
@@ -421,11 +606,11 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                 existing_meta.update(
                     {
                         "sentiment": {
-                            "positive_pct": positive_pct,
-                            "neutral_pct": neutral_pct,
-                            "negative_pct": negative_pct,
+                            "positive_pct": positive_ratio,
+                            "neutral_pct": neutral_ratio,
+                            "negative_pct": negative_ratio,
                             "total_comments_analyzed": total,
-                            "model": "vader" if _use_vader else "roberta",
+                            "model": "roberta_or_vader",
                             "analyzed_at": datetime.now(timezone.utc).isoformat(),
                         }
                     }
@@ -441,18 +626,18 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
 
         return {
             "total": total,
-            "positive_pct": positive_pct,
-            "neutral_pct": neutral_pct,
-            "negative_pct": negative_pct,
+            "positive_pct": positive_ratio,
+            "neutral_pct": neutral_ratio,
+            "negative_pct": negative_ratio,
         }
 
     finally:
-        await close_mongo()
+        client.close()
 
 
 # ─── Celery Tasks ───────────────────────────────────────────────────────────
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_youtube_data")
 def tasks_ingest_youtube_data(self, channel_id: str) -> str:
     """
     Celery task to ingest YouTube data.
@@ -467,7 +652,7 @@ def tasks_ingest_youtube_data(self, channel_id: str) -> str:
         raise self.retry(exc=exc, countdown=60)
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_reddit_data")
 def tasks_ingest_reddit_data(self, subreddit_name: str) -> str:
     """
     Celery task to ingest Reddit data.

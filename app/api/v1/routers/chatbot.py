@@ -4,19 +4,30 @@ Chatbot Router  —  /api/v1/chatbot
 
 Endpoints
 ---------
-POST /query   — Accept a user question + active dashboard context, inject a
-                dynamic system prompt, and return an AI answer from Groq Cloud
-                (LLaMA 3.3 70B). Fast inference, free tier available.
+POST /query   — Accept a user question + active dashboard context, pull
+                REAL-TIME metrics from MongoDB + PostgreSQL, inject them
+                into a dynamic system prompt, and return an AI answer from
+                Groq Cloud (LLaMA 3.3 70B).
 
 Context → System Prompt mapping
 --------------------------------
-  youtube       →  Video Performance Consultant
-  reddit        →  Community Management Specialist
-  cross-platform→  Cross-Channel Strategist (synthesises both)
+  youtube       →  Video Performance Consultant  (real YT channel stats)
+  reddit        →  Community Management Specialist  (real subreddit stats)
+  cross-platform→  Cross-Channel Strategist (stats from both platforms)
+
+Data flow
+---------
+  1. Fetch real metrics from MongoDB (video_payloads, comments) + PostgreSQL
+  2. Build a context block with actual numbers
+  3. Inject into system prompt before the LLM call
+  4. LLM answers ONLY based on provided real data
 """
 
 from __future__ import annotations
 
+import re
+import string
+from collections import Counter
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, status
@@ -24,46 +35,240 @@ from openai import AsyncOpenAI, APIConnectionError, AuthenticationError
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.db.mongodb import get_comments_collection, get_video_payloads_collection, get_mongo_db
+from app.db.postgres import Platform, PlatformAccount, get_db_session
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
-# ─── System Prompt Templates ──────────────────────────────────────────────────
+# ─── Stopwords for keyword extraction ─────────────────────────────────────────
 
-_SYSTEM_PROMPTS: dict[str, str] = {
-    "youtube": (
-        "You are an expert YouTube Video Performance Consultant with deep knowledge "
-        "of the YouTube algorithm, audience retention, CTR optimisation, and "
-        "sentiment-driven content strategy. "
-        "The user is viewing a live analytics dashboard that tracks their YouTube "
-        "channels — including subscriber counts, view counts, likes, and comment "
-        "sentiment distributions (positive/neutral/negative). "
-        "Give concise, data-informed, actionable advice. "
-        "If the user asks about their numbers, encourage them to mention the specific "
-        "metrics they see on screen. "
-        "Keep answers under 250 words unless a detailed breakdown is explicitly asked for."
-    ),
-    "reddit": (
-        "You are an expert Reddit Community Management Specialist with deep "
-        "knowledge of subreddit growth strategies, upvote mechanics, community "
-        "engagement tactics, keyword trend analysis, and sentiment management. "
-        "The user is viewing a live analytics dashboard that tracks their Reddit "
-        "subreddits — including member counts, trending keywords, post volume, "
-        "and comment sentiment. "
-        "Give concise, community-first, actionable advice. "
-        "Keep answers under 250 words unless a detailed breakdown is explicitly asked for."
-    ),
-    "cross-platform": (
-        "You are an expert Cross-Platform Content Strategist specialising in "
-        "bridging YouTube and Reddit audiences. You synthesise insights from both "
-        "platforms to create integrated channel playbooks. "
-        "The user is viewing a live cross-platform analytics dashboard that maps "
-        "YouTube video performance against Reddit discussion volume and upvote "
-        "velocity — enabling content propagation analysis. "
-        "Give concise, integrated, actionable advice that leverages data from both "
-        "platforms simultaneously. "
-        "Keep answers under 300 words unless a detailed breakdown is explicitly asked for."
-    ),
-}
+_STOPWORDS = frozenset(
+    "the a an and or but in on at to for of with by from is are was were be been "
+    "being have has had do does did will would could should may might shall can "
+    "not no nor so yet both either neither one two three i me my we our you your "
+    "he she it its they them their this that these those what which who whom how "
+    "when where why than then also just more very much many some any all each "
+    "about after before between into through during again further once".split()
+)
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fmt(n) -> str:
+    if n is None:
+        return "N/A"
+    n = int(n)
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.1f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+
+def _extract_keywords(texts: list[str], top_n: int = 8) -> list[str]:
+    """Extract top keywords from a list of comment bodies."""
+    words = []
+    for t in texts:
+        t = t.lower()
+        t = re.sub(r"http\S+", "", t)
+        t = t.translate(str.maketrans("", "", string.punctuation))
+        for w in t.split():
+            if len(w) > 3 and w not in _STOPWORDS:
+                words.append(w)
+    counts = Counter(words)
+    return [w for w, _ in counts.most_common(top_n)]
+
+
+# ─── Real-time context fetchers ───────────────────────────────────────────────
+
+async def _fetch_youtube_context() -> str:
+    """Pull real YouTube metrics from PostgreSQL + MongoDB."""
+    from sqlalchemy import select, text
+
+    try:
+        payloads_coll = get_video_payloads_collection()
+        comments_coll = get_comments_collection()
+
+        # --- PostgreSQL: get all tracked YouTube channels ---
+        engine_ctx = get_db_session()
+        channels_data = []
+
+        async for session in engine_ctx:
+            from sqlalchemy import select as sa_select
+            stmt = sa_select(PlatformAccount).where(
+                PlatformAccount.platform == Platform.YOUTUBE
+            )
+            result = await session.execute(stmt)
+            accounts = result.scalars().all()
+            for acc in accounts:
+                channels_data.append({
+                    "channel_id": acc.platform_id,
+                    "name": acc.display_name or acc.platform_id,
+                    "subscribers": acc.subscriber_count,
+                })
+            break
+
+        if not channels_data:
+            return "No YouTube channels are currently being tracked in the database."
+
+        lines = [f"TRACKED YOUTUBE CHANNELS ({len(channels_data)} total):"]
+
+        for ch in channels_data[:5]:  # limit to top 5 to keep prompt size manageable
+            chan_id = ch["channel_id"]
+            name    = ch["name"]
+
+            # MongoDB: latest snapshot stats for this channel
+            payload = await payloads_coll.find_one(
+                {"platform": "youtube", "platform_id": chan_id},
+                {"_id": 0, "stats": 1},
+            )
+            stats = (payload or {}).get("stats", {}) if payload else {}
+
+            # MongoDB: recent comment count + sentiment
+            total_comments = await comments_coll.count_documents(
+                {"platform": "youtube", "parent_id": chan_id}
+            )
+
+            # Fetch a sample of recent comments for keyword extraction
+            sample_cursor = (
+                comments_coll
+                .find({"platform": "youtube", "parent_id": chan_id}, {"_id": 0, "body": 1})
+                .sort("ingested_at", -1)
+                .limit(50)
+            )
+            sample_docs = await sample_cursor.to_list(length=50)
+            bodies = [d.get("body", "") for d in sample_docs]
+            keywords = _extract_keywords(bodies, top_n=5) if bodies else []
+
+            # Sentiment counts from sentiment_label field
+            pos_count = await comments_coll.count_documents(
+                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "positive"}
+            )
+            neg_count = await comments_coll.count_documents(
+                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "negative"}
+            )
+            neu_count = await comments_coll.count_documents(
+                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "neutral"}
+            )
+            analyzed = pos_count + neg_count + neu_count
+
+            lines.append(f"\n  Channel: {name} (ID: {chan_id})")
+            lines.append(f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}")
+            lines.append(f"    Total Views: {_fmt(stats.get('views'))}")
+            lines.append(f"    Total Likes: {_fmt(stats.get('likes'))}")
+            lines.append(f"    Total Videos: {_fmt(stats.get('videos'))}")
+            lines.append(f"    Tracked Comments: {_fmt(total_comments)}")
+            if analyzed > 0:
+                lines.append(
+                    f"    Sentiment (of {_fmt(analyzed)} analyzed): "
+                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+                )
+                dominant = max(
+                    [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
+                    key=lambda x: x[1]
+                )[0]
+                lines.append(f"    Dominant Sentiment: {dominant}")
+            if keywords:
+                lines.append(f"    Top Keywords in Comments: {', '.join(keywords)}")
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        return f"(Could not fetch YouTube data: {exc})"
+
+
+async def _fetch_reddit_context() -> str:
+    """Pull real Reddit metrics from PostgreSQL + MongoDB."""
+    try:
+        payloads_coll = get_video_payloads_collection()
+        comments_coll = get_comments_collection()
+
+        # PostgreSQL: all tracked subreddits
+        engine_ctx = get_db_session()
+        subreddits_data = []
+
+        async for session in engine_ctx:
+            from sqlalchemy import select as sa_select
+            stmt = sa_select(PlatformAccount).where(
+                PlatformAccount.platform == Platform.REDDIT
+            )
+            result = await session.execute(stmt)
+            accounts = result.scalars().all()
+            for acc in accounts:
+                subreddits_data.append({
+                    "subreddit_name": acc.platform_id,
+                    "name": acc.display_name or acc.platform_id,
+                    "members": acc.subscriber_count,
+                })
+            break
+
+        if not subreddits_data:
+            return "No subreddits are currently being tracked in the database."
+
+        lines = [f"TRACKED SUBREDDITS ({len(subreddits_data)} total):"]
+
+        for sub in subreddits_data[:5]:
+            sub_id = sub["subreddit_name"]
+            name   = sub["name"]
+
+            # MongoDB: latest payload for subreddit-level stats
+            payload = await payloads_coll.find_one(
+                {"platform": "reddit", "platform_id": sub_id},
+                {"_id": 0, "stats": 1},
+            )
+            stats = (payload or {}).get("stats", {}) if payload else {}
+
+            # Comment stats
+            total_comments = await comments_coll.count_documents(
+                {"platform": "reddit", "parent_id": sub_id}
+            )
+
+            # Keyword extraction from recent comments
+            sample_cursor = (
+                comments_coll
+                .find({"platform": "reddit", "parent_id": sub_id}, {"_id": 0, "body": 1})
+                .sort("ingested_at", -1)
+                .limit(100)
+            )
+            sample_docs = await sample_cursor.to_list(length=100)
+            bodies = [d.get("body", "") for d in sample_docs]
+            keywords = _extract_keywords(bodies, top_n=8) if bodies else []
+
+            # Sentiment
+            pos_count = await comments_coll.count_documents(
+                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "positive"}
+            )
+            neg_count = await comments_coll.count_documents(
+                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "negative"}
+            )
+            neu_count = await comments_coll.count_documents(
+                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "neutral"}
+            )
+            analyzed = pos_count + neg_count + neu_count
+
+            lines.append(f"\n  r/{name} (internal ID: {sub_id})")
+            lines.append(f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}")
+            lines.append(f"    Total Posts Tracked: {_fmt(stats.get('posts', stats.get('total_posts')))}")
+            lines.append(f"    Tracked Comments in DB: {_fmt(total_comments)}")
+            if analyzed > 0:
+                lines.append(
+                    f"    Sentiment (of {_fmt(analyzed)} analyzed): "
+                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+                )
+                dominant = max(
+                    [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
+                    key=lambda x: x[1]
+                )[0]
+                lines.append(f"    Dominant Sentiment: {dominant}")
+            if keywords:
+                lines.append(f"    Top Trending Keywords: {', '.join(keywords)}")
+
+        return "\n".join(lines)
+
+    except Exception as exc:
+        return f"(Could not fetch Reddit data: {exc})"
+
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -91,22 +296,68 @@ class ChatbotResponse(BaseModel):
     model: str = Field(..., description="LLM model that produced the response")
 
 
+# ─── System prompt builder ────────────────────────────────────────────────────
+
+def _build_system_prompt(context: str, live_data: str) -> str:
+    """Build a system prompt that includes the live data snapshot."""
+
+    base_instructions = {
+        "youtube": (
+            "You are an expert YouTube Video Performance Consultant with deep knowledge "
+            "of the YouTube algorithm, audience retention, CTR optimisation, and "
+            "sentiment-driven content strategy. "
+        ),
+        "reddit": (
+            "You are an expert Reddit Community Management Specialist with deep "
+            "knowledge of subreddit growth strategies, upvote mechanics, community "
+            "engagement tactics, keyword trend analysis, and sentiment management. "
+        ),
+        "cross-platform": (
+            "You are an expert Cross-Platform Content Strategist specialising in "
+            "bridging YouTube and Reddit audiences. You synthesise insights from both "
+            "platforms to create integrated channel playbooks. "
+        ),
+    }
+
+    rules = (
+        "IMPORTANT RULES:\n"
+        "- You have been given REAL, LIVE data from the user's actual database below.\n"
+        "- ALWAYS use this real data to answer questions — never invent or fabricate numbers.\n"
+        "- If a specific metric shows 'N/A', it means it hasn't been ingested yet; say so clearly.\n"
+        "- Give concise, data-informed, actionable advice based strictly on the numbers provided.\n"
+        "- Keep answers under 300 words unless a detailed breakdown is explicitly requested.\n"
+        "- If the user asks about something not in the data, say what data IS available.\n"
+    )
+
+    return (
+        f"{base_instructions.get(context, base_instructions['youtube'])}\n\n"
+        f"{rules}\n\n"
+        f"=== LIVE DATA FROM DATABASE (fetched right now) ===\n"
+        f"{live_data}\n"
+        f"=== END OF LIVE DATA ===\n\n"
+        f"Use the above real data to answer the user's question."
+    )
+
+
 # ─── Endpoint ────────────────────────────────────────────────────────────────
 
 @router.post(
     "/query",
     response_model=ChatbotResponse,
-    summary="Query the context-aware AI analyst",
+    summary="Query the context-aware AI analyst with real-time dashboard data",
     description=(
         "Submit a question along with the active dashboard platform context. "
-        "The system prompt dynamically adapts to act as the most relevant "
-        "expert persona for the given context."
+        "The system fetches REAL metrics from MongoDB + PostgreSQL, injects them "
+        "into the system prompt, then calls Groq LLM so answers are based on your "
+        "actual data — not hallucinated numbers."
     ),
 )
 async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     """
-    Dynamically select a system prompt based on `context`, call the Grok API
-    (OpenAI-compatible), and return the AI response.
+    1. Fetch real-time metrics from the database for the given context.
+    2. Build a system prompt containing those metrics.
+    3. Call the Groq API with the enriched prompt.
+    4. Return the grounded, data-aware response.
     """
     settings = get_settings()
 
@@ -119,9 +370,20 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
             ),
         )
 
-    system_prompt = _SYSTEM_PROMPTS[payload.context]
+    # ── 1. Fetch live data based on context ──────────────────────────────────
+    if payload.context == "youtube":
+        live_data = await _fetch_youtube_context()
+    elif payload.context == "reddit":
+        live_data = await _fetch_reddit_context()
+    else:  # cross-platform
+        yt_data  = await _fetch_youtube_context()
+        rd_data  = await _fetch_reddit_context()
+        live_data = f"--- YouTube ---\n{yt_data}\n\n--- Reddit ---\n{rd_data}"
 
-    # Groq Cloud uses an OpenAI-compatible API — just swap the base_url
+    # ── 2. Build grounded system prompt ──────────────────────────────────────
+    system_prompt = _build_system_prompt(payload.context, live_data)
+
+    # ── 3. Call Groq Cloud LLM ────────────────────────────────────────────────
     client = AsyncOpenAI(
         api_key=settings.GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
@@ -134,9 +396,9 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": payload.question},
+                {"role": "user",   "content": payload.question},
             ],
-            temperature=0.7,
+            temperature=0.4,   # lower temp → more factual, less creative
             max_tokens=512,
         )
     except AuthenticationError:
@@ -147,7 +409,7 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     except APIConnectionError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Could not connect to the Grok API: {exc}",
+            detail=f"Could not connect to the Groq API: {exc}",
         )
     except Exception as exc:
         raise HTTPException(

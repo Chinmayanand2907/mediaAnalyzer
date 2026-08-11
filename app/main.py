@@ -27,8 +27,11 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     print(f"🚀  Starting {settings.APP_NAME} [{settings.APP_ENV}]")
     await init_postgres()
-    await connect_mongo()
-    await ensure_indexes()
+    try:
+        await connect_mongo()
+        await ensure_indexes()
+    except Exception as e:
+        print(f"⚠️  Mongo initialization warning: {e}")
     yield
     # ── Shutdown ─────────────────────────────────────────────
     await close_mongo()

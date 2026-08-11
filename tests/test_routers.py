@@ -43,7 +43,7 @@ async def test_reddit_subreddits_empty(test_client):
 @pytest.mark.asyncio
 async def test_reddit_trigger_ingest(test_client, mocker):
     """Test triggering a celery task for reddit."""
-    mock_task = mocker.patch("app.api.v1.routers.reddit.tasks_ingest_reddit_data.delay")
+    mock_task = mocker.patch("app.api.v1.routers.reddit.celery_app.send_task")
     mock_task.return_value.id = "test-task-id"
     
     response = await test_client.post("/api/v1/reddit/subreddits/python/ingest")

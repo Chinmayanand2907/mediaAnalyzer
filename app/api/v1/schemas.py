@@ -95,6 +95,10 @@ class SharedVideoItem(BaseModel):
     total_reddit_shares: int
     youtube_views: Optional[int]
     youtube_likes: Optional[int]
+    youtube_comment_count: Optional[int] = None
+    youtube_title: Optional[str] = None
+    youtube_thumbnail_url: Optional[str] = None
+    youtube_channel_title: Optional[str] = None
     reddit_total_upvotes: Optional[int]
     reddit_total_comments: Optional[int]
 

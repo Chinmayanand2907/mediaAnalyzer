@@ -78,7 +78,7 @@ export default function Navbar({ platform, onPlatformChange }) {
             }}
           >
             <Icon size={15} color={active.accent} />
-            <span>Switch Platform</span>
+            <span>{active.label}</span>
             <ChevronDown
               size={14}
               color="var(--text-muted)"

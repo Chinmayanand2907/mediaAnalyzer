@@ -24,7 +24,7 @@ GET /correlation-summary
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -93,9 +93,9 @@ def _normalise_engagement(raw: Dict[str, Any], platform: str) -> float:
     summary="YouTube videos found shared inside Reddit threads",
 )
 async def get_shared_videos(
-    subreddit_name: str = Query(
-        ...,
-        description="The subreddit to scan for YouTube links (e.g. 'learnprogramming')",
+    subreddit_name: Optional[str] = Query(
+        default=None,
+        description="The subreddit to scan for YouTube links (or leave blank to scan all subreddits)",
     ),
     limit: int = Query(
         default=500,
@@ -105,20 +105,24 @@ async def get_shared_videos(
     ),
 ) -> List[SharedVideoItem]:
     """
-    Scans up to *limit* Reddit comments in *subreddit_name* for YouTube video
-    URLs.  For each unique video ID found, looks up its stored metrics in
-    MongoDB.
-
-    This powers the "Videos shared on Reddit" cross-platform widget.
+    Scans up to *limit* Reddit comments for YouTube video URLs.
+    For each unique video ID found, looks up its stored metrics in MongoDB
+    and falls back to live YouTube Data API for any videos not yet cached.
     """
+    from app.services.external.youtube_client import YouTubeClient, YouTubeAPIError
+
     comments_coll = get_comments_collection()
     payloads_coll = get_video_payloads_collection()
 
-    # 1. Fetch Reddit comment bodies for the target subreddit
+    # 1. Fetch Reddit comment bodies
+    query_filter: Dict[str, Any] = {"platform": "reddit"}
+    if subreddit_name:
+        query_filter["parent_id"] = subreddit_name
+
     cursor = (
         comments_coll
         .find(
-            {"platform": "reddit", "parent_id": subreddit_name},
+            query_filter,
             {"_id": 0, "platform_id": 1, "body": 1},
         )
         .sort("ingested_at", -1)
@@ -143,15 +147,69 @@ async def get_shared_videos(
     if not video_to_posts:
         return []
 
+    all_video_ids = list(video_to_posts.keys())
+
     # 3. Fetch YouTube payload snapshots from MongoDB for matched video IDs
     yt_cursor = payloads_coll.find(
-        {"platform": "youtube", "platform_id": {"$in": list(video_to_posts.keys())}},
+        {"platform": "youtube", "platform_id": {"$in": all_video_ids}},
         {"_id": 0, "platform_id": 1, "stats": 1},
     )
     yt_docs = await yt_cursor.to_list(length=len(video_to_posts))
     yt_stats: Dict[str, Dict] = {d["platform_id"]: d.get("stats", {}) for d in yt_docs}
 
-    # 4. Fetch Reddit post-level upvote/comment totals for the discovered posts
+    # 4. For video IDs missing from MongoDB, batch-fetch from the YouTube API
+    missing_ids = [vid for vid in all_video_ids if vid not in yt_stats]
+    yt_live_meta: Dict[str, Any] = {}  # vid_id -> full metadata dict
+
+    if missing_ids:
+        try:
+            yt_client = YouTubeClient()
+            # YouTube API supports up to 50 IDs per request — batch in chunks
+            chunk_size = 50
+            import asyncio as _asyncio
+            from googleapiclient.discovery import build as _build
+
+            async def _fetch_batch(ids: List[str]) -> dict:
+                """Fetch snippet+statistics for up to 50 video IDs in one call."""
+                request = yt_client._service.videos().list(
+                    part="snippet,statistics",
+                    id=",".join(ids),
+                )
+                data = await _asyncio.to_thread(request.execute)
+                result = {}
+                for item in data.get("items", []):
+                    vid = item.get("id", "")
+                    snippet = item.get("snippet", {})
+                    stats = item.get("statistics", {})
+                    thumbnails = snippet.get("thumbnails", {})
+                    thumb = (
+                        thumbnails.get("high", {}).get("url")
+                        or thumbnails.get("medium", {}).get("url")
+                        or thumbnails.get("default", {}).get("url")
+                    )
+                    result[vid] = {
+                        "title":          snippet.get("title", ""),
+                        "channel_title":  snippet.get("channelTitle", ""),
+                        "thumbnail_url":  thumb,
+                        "views":          int(stats.get("viewCount", 0) or 0),
+                        "likes":          int(stats.get("likeCount", 0) or 0),
+                        "comment_count":  int(stats.get("commentCount", 0) or 0),
+                    }
+                return result
+
+            # Gather all chunks concurrently
+            chunks = [missing_ids[i:i + chunk_size] for i in range(0, len(missing_ids), chunk_size)]
+            chunk_results = await _asyncio.gather(*[_fetch_batch(chunk) for chunk in chunks], return_exceptions=True)
+            for res in chunk_results:
+                if isinstance(res, dict):
+                    yt_live_meta.update(res)
+
+        except YouTubeAPIError as exc:
+            logger.warning("YouTube API unavailable for live metadata fetch: %s", exc)
+        except Exception as exc:
+            logger.warning("Unexpected error fetching live YouTube metadata: %s", exc)
+
+    # 5. Fetch Reddit post-level upvote/comment totals for the discovered posts
     all_post_ids = [pid for pids in video_to_posts.values() for pid in pids]
     reddit_post_cursor = payloads_coll.find(
         {"platform": "reddit", "platform_id": {"$in": all_post_ids}},
@@ -162,10 +220,20 @@ async def get_shared_videos(
         d["platform_id"]: d.get("stats", {}) for d in reddit_post_docs
     }
 
-    # 5. Build response
+    # 6. Build response — prefer MongoDB cache, fall back to live API data
     shared: List[SharedVideoItem] = []
     for vid_id, post_ids in video_to_posts.items():
-        yt = yt_stats.get(vid_id, {})
+        mongo_yt = yt_stats.get(vid_id, {})
+        live_yt  = yt_live_meta.get(vid_id, {})
+
+        # Prefer cached MongoDB data, fall back to live API
+        views          = mongo_yt.get("views")  or (live_yt.get("views") if live_yt else None)
+        likes          = mongo_yt.get("likes")  or (live_yt.get("likes") if live_yt else None)
+        comment_count  = live_yt.get("comment_count") if live_yt else None
+        title          = live_yt.get("title") if live_yt else None
+        thumbnail_url  = live_yt.get("thumbnail_url") if live_yt else None
+        channel_title  = live_yt.get("channel_title") if live_yt else None
+
         reddit_upvotes  = sum(reddit_post_stats.get(pid, {}).get("upvotes",  0) for pid in post_ids)
         reddit_comments = sum(reddit_post_stats.get(pid, {}).get("comments", 0) for pid in post_ids)
 
@@ -174,18 +242,115 @@ async def get_shared_videos(
                 youtube_video_id=vid_id,
                 youtube_url=f"https://www.youtube.com/watch?v={vid_id}",
                 reddit_post_ids=post_ids,
-                reddit_subreddits=[subreddit_name],
+                reddit_subreddits=[subreddit_name] if subreddit_name else [],
                 total_reddit_shares=len(post_ids),
-                youtube_views=yt.get("views"),
-                youtube_likes=yt.get("likes"),
+                youtube_views=views,
+                youtube_likes=likes,
+                youtube_comment_count=comment_count,
+                youtube_title=title,
+                youtube_thumbnail_url=thumbnail_url,
+                youtube_channel_title=channel_title,
                 reddit_total_upvotes=reddit_upvotes or None,
                 reddit_total_comments=reddit_comments or None,
             )
         )
 
-    # Sort by number of Reddit shares descending
-    shared.sort(key=lambda x: x.total_reddit_shares, reverse=True)
+    # Sort by Reddit shares descending, then by YouTube views descending
+    shared.sort(key=lambda x: (x.total_reddit_shares, x.youtube_views or 0), reverse=True)
     return shared
+
+
+@router.get(
+    "/top-videos",
+    response_model=List[SharedVideoItem],
+    summary="Top YouTube videos for a given topic keyword",
+)
+async def get_top_videos_for_topic(
+    topic: str = Query(
+        ...,
+        description="Topic / keyword to search for (e.g. 'gaming', 'python tutorial')",
+    ),
+    max_results: int = Query(
+        default=10,
+        ge=1,
+        le=25,
+        description="Number of top videos to return",
+    ),
+) -> List[SharedVideoItem]:
+    """
+    Uses the YouTube Data API to search for the most viewed/relevant videos
+    for a given topic.  Returns them in SharedVideoItem format so the
+    Cross-Platform table can display them alongside Reddit-discovered links.
+    """
+    from app.services.external.youtube_client import YouTubeClient, YouTubeAPIError
+    import asyncio as _asyncio
+
+    try:
+        yt_client = YouTubeClient()
+
+        # Step 1 — search for top videos by topic, ordered by view count
+        search_request = yt_client._service.search().list(
+            part="snippet",
+            q=topic,
+            type="video",
+            order="viewCount",
+            maxResults=max_results,
+            relevanceLanguage="en",
+        )
+        search_data = await _asyncio.to_thread(search_request.execute)
+        video_ids = [
+            item["id"]["videoId"]
+            for item in search_data.get("items", [])
+            if item.get("id", {}).get("videoId")
+        ]
+
+        if not video_ids:
+            return []
+
+        # Step 2 — batch-fetch statistics for those video IDs
+        stats_request = yt_client._service.videos().list(
+            part="snippet,statistics",
+            id=",".join(video_ids),
+        )
+        stats_data = await _asyncio.to_thread(stats_request.execute)
+
+        results: List[SharedVideoItem] = []
+        for item in stats_data.get("items", []):
+            vid_id  = item.get("id", "")
+            snippet = item.get("snippet", {})
+            stats   = item.get("statistics", {})
+            thumbnails = snippet.get("thumbnails", {})
+            thumb = (
+                thumbnails.get("high", {}).get("url")
+                or thumbnails.get("medium", {}).get("url")
+                or thumbnails.get("default", {}).get("url")
+            )
+            results.append(SharedVideoItem(
+                youtube_video_id=vid_id,
+                youtube_url=f"https://www.youtube.com/watch?v={vid_id}",
+                reddit_post_ids=[],
+                reddit_subreddits=[],
+                total_reddit_shares=0,
+                youtube_views=int(stats.get("viewCount", 0) or 0),
+                youtube_likes=int(stats.get("likeCount", 0) or 0),
+                youtube_comment_count=int(stats.get("commentCount", 0) or 0),
+                youtube_title=snippet.get("title", ""),
+                youtube_thumbnail_url=thumb,
+                youtube_channel_title=snippet.get("channelTitle", ""),
+                reddit_total_upvotes=None,
+                reddit_total_comments=None,
+            ))
+
+        # Sort by views descending
+        results.sort(key=lambda x: x.youtube_views or 0, reverse=True)
+        return results
+
+    except YouTubeAPIError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"YouTube API error: {exc}",
+        )
+
 
 
 @router.get(
@@ -246,8 +411,8 @@ async def get_engagement_comparison(
     summary="Full cross-platform correlation in a single payload",
 )
 async def get_correlation_summary(
-    subreddit_name: str = Query(
-        ...,
+    subreddit_name: Optional[str] = Query(
+        default=None,
         description="Subreddit to scan for YouTube links",
     ),
     comment_scan_limit: int = Query(

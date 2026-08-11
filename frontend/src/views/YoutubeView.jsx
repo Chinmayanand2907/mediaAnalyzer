@@ -1,5 +1,5 @@
-import { useState, useCallback } from 'react';
-import { Users, Eye, ThumbsUp, Video, RefreshCw, Play } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { Users, Eye, ThumbsUp, Video, RefreshCw, Play, PlusCircle } from 'lucide-react';
 
 import { useAnalytics } from '../hooks/useAnalytics';
 import {
@@ -25,47 +25,85 @@ function fmt(n) {
 
 export default function YoutubeView() {
   const [selectedChannel, setSelectedChannel] = useState(null);
+  const [newChannelInput, setNewChannelInput] = useState('');
+  const [inputMode, setInputMode] = useState(false); // toggle between dropdown and text input
   const [page, setPage]                       = useState(1);
   const [sentFilter, setSentFilter]           = useState(null);
   const [ingestMsg, setIngestMsg]             = useState('');
-
-  // ── Channel list ─────────────────────────────────────────────────────────
-  const { data: channels, loading: channelsLoading } = useAnalytics(
+  const [ingestLoading, setIngestLoading]     = useState(false);  // ── Channel list ─────────────────────────────────────────────────────────
+  const { data: channels, loading: channelsLoading, refetch: refetchChannels } = useAnalytics(
     (signal) => fetchYoutubeChannels(signal),
     []
   );
 
   // ── Channel metrics ──────────────────────────────────────────────────────
-  const { data: metrics, loading: metricsLoading } = useAnalytics(
+  const { data: metrics, loading: metricsLoading, refetch: refetchMetrics } = useAnalytics(
     (signal) => fetchYoutubeChannel(selectedChannel, signal),
     [selectedChannel],
     { enabled: !!selectedChannel }
   );
 
   // ── Sentiment ────────────────────────────────────────────────────────────
-  const { data: sentiment, loading: sentLoading } = useAnalytics(
+  const { data: sentiment, loading: sentLoading, refetch: refetchSentiment } = useAnalytics(
     (signal) => fetchYoutubeSentiment(selectedChannel, 200, signal),
     [selectedChannel],
     { enabled: !!selectedChannel }
   );
 
   // ── Comments ─────────────────────────────────────────────────────────────
-  const { data: comments, loading: commentsLoading } = useAnalytics(
+  const { data: comments, loading: commentsLoading, refetch: refetchComments } = useAnalytics(
     (signal) => fetchYoutubeComments(selectedChannel, page, 20, sentFilter, signal),
     [selectedChannel, page, sentFilter],
     { enabled: !!selectedChannel }
   );
 
-  const handleIngest = async () => {
-    if (!selectedChannel) return;
-    setIngestMsg('Queuing ingestion…');
+  // Auto-select the first channel when data loads if none is selected
+  useEffect(() => {
+    if (!selectedChannel && channels && channels.length > 0) {
+      setSelectedChannel(channels[0].channel_id);
+    }
+  }, [channels, selectedChannel]);
+
+  const handleIngest = async (channelId) => {
+    const target = channelId || selectedChannel;
+    if (!target) return;
+    setIngestLoading(true);
+    setIngestMsg('⏳ Queuing ingestion task...');
     try {
-      const res = await triggerYoutubeIngest(selectedChannel);
-      setIngestMsg(`✅ ${res.message}`);
+      const res = await triggerYoutubeIngest(target);
+      setIngestMsg(`⏳ Ingestion started: ${res.message} — Updating metrics...`);
+      
+      const isNewChannel = !selectedChannel || selectedChannel !== target;
+      if (isNewChannel) {
+        setTimeout(() => {
+          setSelectedChannel(target);
+          setNewChannelInput('');
+          setInputMode(false);
+          setPage(1);
+          setSentFilter(null);
+        }, 1500);
+      }
+
+      // Poll multiple times because Celery tasks can take 10+ seconds
+      let pollCount = 0;
+      const intervalId = setInterval(() => {
+        pollCount += 1;
+        refetchChannels();
+        refetchMetrics();
+        refetchSentiment();
+        refetchComments();
+        
+        if (pollCount >= 4) {
+          clearInterval(intervalId);
+          setIngestMsg('✅ Ingestion complete! Latest data & channel timestamp loaded.');
+          setIngestLoading(false);
+        }
+      }, 3500);
     } catch (e) {
       setIngestMsg(`❌ ${e.message}`);
+      setIngestLoading(false);
     }
-    setTimeout(() => setIngestMsg(''), 6000);
+    setTimeout(() => setIngestMsg(''), 15000);
   };
 
   return (
@@ -84,45 +122,109 @@ export default function YoutubeView() {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           {/* Channel selector */}
-          <div style={{ position: 'relative' }}>
-            <select
-              className="platform-select"
-              value={selectedChannel ?? ''}
-              onChange={(e) => { setSelectedChannel(e.target.value || null); setPage(1); setSentFilter(null); }}
-              style={{ minWidth: 200 }}
-            >
-              <option value="">— Select a channel —</option>
-              {(channels ?? []).map((ch) => (
-                <option key={ch.channel_id} value={ch.channel_id}>
-                  {ch.display_name}
-                </option>
-              ))}
-            </select>
-            {channelsLoading && (
-              <span style={{ position: 'absolute', right: 36, top: '50%', transform: 'translateY(-50%)', fontSize: 11, color: 'var(--text-muted)' }}>
-                Loading…
-              </span>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {!inputMode ? (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ position: 'relative' }}>
+                  <select
+                    className="platform-select"
+                    value={selectedChannel ?? ''}
+                    onChange={(e) => { setSelectedChannel(e.target.value || null); setPage(1); setSentFilter(null); }}
+                    style={{ minWidth: 200 }}
+                  >
+                    <option value="">— Select a channel —</option>
+                    {(channels ?? []).map((ch) => (
+                      <option key={ch.channel_id} value={ch.channel_id}>
+                        {ch.display_name || ch.channel_id}
+                      </option>
+                    ))}
+                  </select>
+                  {channelsLoading && (
+                    <span style={{ position: 'absolute', right: 36, top: '50%', transform: 'translateY(-50%)', fontSize: 11, color: 'var(--text-muted)' }}>
+                      Loading…
+                    </span>
+                  )}
+                </div>
+                <button
+                  onClick={() => setInputMode(true)}
+                  title="Add a new channel by ID"
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    padding: '7px 12px', borderRadius: 10,
+                    background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid var(--border)',
+                    color: 'var(--text-muted)', fontSize: 12, fontWeight: 600,
+                    cursor: 'pointer', whiteSpace: 'nowrap',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <PlusCircle size={13} /> Add new
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input
+                  type="text"
+                  autoFocus
+                  placeholder="Enter YouTube Channel ID (e.g. UCxxxxxx)"
+                  value={newChannelInput}
+                  onChange={(e) => setNewChannelInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && newChannelInput.trim()) handleIngest(newChannelInput.trim()); if (e.key === 'Escape') setInputMode(false); }}
+                  style={{
+                    minWidth: 280, padding: '8px 12px', borderRadius: 10,
+                    background: 'rgba(255,255,255,0.06)',
+                    border: '1px solid rgba(99,102,241,0.45)',
+                    color: 'var(--text-primary)', fontSize: 13,
+                    outline: 'none',
+                  }}
+                />
+                <button
+                  onClick={() => { if (newChannelInput.trim()) handleIngest(newChannelInput.trim()); }}
+                  disabled={!newChannelInput.trim() || ingestLoading}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 5,
+                    padding: '8px 14px', borderRadius: 10,
+                    background: newChannelInput.trim() ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.04)',
+                    border: `1px solid ${newChannelInput.trim() ? 'rgba(99,102,241,0.5)' : 'var(--border)'}`,
+                    color: newChannelInput.trim() ? 'var(--yt-primary)' : 'var(--text-muted)',
+                    fontSize: 13, fontWeight: 600, cursor: 'pointer',
+                    transition: 'all 0.2s',
+                  }}
+                >
+                  <PlusCircle size={13} /> Ingest
+                </button>
+                <button
+                  onClick={() => { setInputMode(false); setNewChannelInput(''); }}
+                  style={{
+                    padding: '7px 10px', borderRadius: 10,
+                    background: 'transparent', border: '1px solid var(--border)',
+                    color: 'var(--text-muted)', fontSize: 12, cursor: 'pointer',
+                  }}
+                >✕</button>
+              </div>
             )}
           </div>
 
-          {/* Ingest button */}
-          <button
-            onClick={handleIngest}
-            disabled={!selectedChannel}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              padding: '8px 14px', borderRadius: 10,
-              background: selectedChannel ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.04)',
-              border: `1px solid ${selectedChannel ? 'rgba(99,102,241,0.4)' : 'var(--border)'}`,
-              color: selectedChannel ? 'var(--yt-primary)' : 'var(--text-muted)',
-              fontSize: 13, fontWeight: 600,
-              cursor: selectedChannel ? 'pointer' : 'not-allowed',
-              transition: 'all 0.2s',
-            }}
-          >
-            <RefreshCw size={14} />
-            Re-ingest
-          </button>
+          {/* Ingest button — only show when a channel is selected from dropdown */}
+          {!inputMode && (
+            <button
+              onClick={() => handleIngest(null)}
+              disabled={!selectedChannel || ingestLoading}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+                padding: '8px 14px', borderRadius: 10,
+                background: selectedChannel ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.04)',
+                border: `1px solid ${selectedChannel ? 'rgba(99,102,241,0.4)' : 'var(--border)'}`,
+                color: selectedChannel ? 'var(--yt-primary)' : 'var(--text-muted)',
+                fontSize: 13, fontWeight: 600,
+                cursor: selectedChannel ? 'pointer' : 'not-allowed',
+                transition: 'all 0.2s',
+              }}
+            >
+              <RefreshCw size={14} style={{ animation: ingestLoading ? 'spin 1s linear infinite' : 'none' }} />
+              Re-ingest
+            </button>
+          )}
         </div>
       </div>
 

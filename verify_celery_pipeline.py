@@ -70,7 +70,7 @@ def verify_task_registration():
 def verify_mock_execution():
     print("\n[4] Executing Mock Task End-to-End...")
     try:
-        channel_id = "UC_mock_channel_id"
+        channel_id = "UCeVMnSShP_Iviwkknt83cww"
         print(f"   Dispatching tasks_ingest_youtube_data for '{channel_id}'...")
         # Dispatch the task
         result = tasks_ingest_youtube_data.delay(channel_id)

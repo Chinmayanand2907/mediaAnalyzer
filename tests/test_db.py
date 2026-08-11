@@ -72,20 +72,16 @@ async def test_mongo_lifecycle_and_collections():
         
         mock_certifi.where.return_value = "/mock/certifi/path"
         
-        # 1. Verify get_mongo_db raises if client is not initialized
+        # 1. Verify get_mongo_db initializes client lazily if not initialized
         from app.db import mongodb
         mongodb._client = None
-        with pytest.raises(RuntimeError):
-            get_mongo_db()
-            
-        # 2. Connect
-        await connect_mongo()
-        
-        # 3. Test db retrieval and collection accessors
         db = get_mongo_db()
         assert db is mock_db
         
-        # Comments collection
+        # 2. Connect
+        await connect_mongo()
+        
+        # 3. Test collection accessors
         comments_col = get_comments_collection()
         mock_db.__getitem__.assert_any_call("comments")
         
@@ -96,6 +92,6 @@ async def test_mongo_lifecycle_and_collections():
         # 4. Close client
         await close_mongo()
         
-        # 5. Check raises after closing
-        with pytest.raises(RuntimeError):
-            get_mongo_db()
+        # 5. Check it initializes again lazily after closing
+        db2 = get_mongo_db()
+        assert db2 is mock_db

@@ -14,7 +14,7 @@ const CustomTooltip = ({ active, payload, label }) => {
         <div key={p.dataKey} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
           <div style={{ width: 8, height: 8, borderRadius: '50%', background: p.color }} />
           <span style={{ color: 'var(--text-secondary)', textTransform: 'capitalize' }}>{p.name}</span>
-          <span style={{ color: 'var(--text-primary)', fontWeight: 700 }}>{p.value?.toFixed(1)}</span>
+          <span style={{ color: 'var(--text-primary)', fontWeight: 700 }}>{(+(p.value ?? 0)).toFixed(1)}</span>
         </div>
       ))}
     </div>

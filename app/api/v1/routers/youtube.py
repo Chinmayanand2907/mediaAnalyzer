@@ -18,6 +18,7 @@ All DB reads use:
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from collections import Counter
 from typing import List, Optional
 
@@ -35,7 +36,7 @@ from app.api.v1.schemas import (
 from app.db.mongodb import get_comments_collection, get_video_payloads_collection
 from app.db.postgres import Platform, PlatformAccount, get_db_session
 from app.services.analytics.sentiment_service import SentimentService, SentimentLabel
-from app.tasks.ingestion_tasks import tasks_ingest_youtube_data
+from app.core.celery_app import celery_app
 
 router = APIRouter(prefix="/youtube", tags=["YouTube"])
 
@@ -43,7 +44,14 @@ router = APIRouter(prefix="/youtube", tags=["YouTube"])
 _sentiment_svc = SentimentService()
 
 
-# ─── Helper ──────────────────────────────────────────────────────────────────
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _as_utc(dt: datetime) -> datetime:
+    """Return *dt* as a timezone-aware UTC datetime regardless of its original tzinfo."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 
 def _account_not_found(channel_id: str) -> HTTPException:
     return HTTPException(
@@ -114,7 +122,24 @@ async def get_youtube_channel(
     )
 
     stats = (payload_doc or {}).get("stats", {})
-    ingested_at = (payload_doc or {}).get("ingested_at")
+    mongo_ingested = (payload_doc or {}).get("ingested_at")
+    pg_updated = account.updated_at
+
+    # Normalise both timestamps to aware UTC before comparing.
+    if mongo_ingested is not None:
+        m_dt: datetime | None = _as_utc(mongo_ingested)
+    else:
+        m_dt = None
+
+    if pg_updated is not None:
+        pg_dt: datetime | None = _as_utc(pg_updated)
+    else:
+        pg_dt = None
+
+    if pg_dt is not None and m_dt is not None:
+        last_ingested = pg_dt if pg_dt > m_dt else m_dt
+    else:
+        last_ingested = pg_dt or m_dt
 
     return YouTubeChannelMetrics(
         channel_id=account.platform_id,
@@ -125,7 +150,7 @@ async def get_youtube_channel(
         total_views=stats.get("views"),
         total_likes=stats.get("likes"),
         total_videos=stats.get("video_count"),
-        last_ingested_at=ingested_at.isoformat() if hasattr(ingested_at, "isoformat") else str(ingested_at) if ingested_at else None,
+        last_ingested_at=last_ingested.isoformat() if hasattr(last_ingested, "isoformat") else str(last_ingested) if last_ingested else None,
     )
 
 
@@ -198,46 +223,76 @@ async def get_youtube_comments(
     """
     Paginated list of comments enriched with per-comment sentiment labels.
     Suitable for the table view in the React dashboard.
+
+    When sentiment_filter is provided the query is pushed down to MongoDB
+    (using the ``sentiment_label`` field written by the ingestion worker)
+    so pagination is correct across the full collection.
     """
     comments_coll = get_comments_collection()
     skip = (page - 1) * page_size
-    fetch_size = page_size * 3  # over-fetch so we can filter after analysis
+
+    mongo_filter: dict = {"platform": "youtube", "parent_id": channel_id}
+    if sentiment_filter:
+        # Only return comments that have been sentiment-labelled and match the filter.
+        mongo_filter["sentiment_label"] = sentiment_filter
 
     cursor = (
         comments_coll
         .find(
-            {"platform": "youtube", "parent_id": channel_id},
-            {"_id": 0, "platform_id": 1, "author": 1, "body": 1, "published_at": 1},
+            mongo_filter,
+            {"_id": 0, "platform_id": 1, "author": 1, "body": 1,
+             "published_at": 1, "sentiment_label": 1},
         )
         .sort("ingested_at", -1)
         .skip(skip)
-        .limit(fetch_size)
+        .limit(page_size)
     )
-    docs = await cursor.to_list(length=fetch_size)
+    docs = await cursor.to_list(length=page_size)
 
     if not docs:
         return []
 
-    texts = [d.get("body", "") for d in docs]
-    results = _sentiment_svc.analyze_batch(texts)
+    # Run the sentiment service only on docs that don't yet have a stored label.
+    texts_needed = [
+        (i, d.get("body", ""))
+        for i, d in enumerate(docs)
+        if not d.get("sentiment_label")
+    ]
+    live_results: dict = {}
+    if texts_needed:
+        indices, texts = zip(*texts_needed)
+        results = _sentiment_svc.analyze_batch(list(texts))
+        live_results = dict(zip(indices, results))
 
     items: List[CommentSentimentItem] = []
-    for doc, res in zip(docs, results):
-        if sentiment_filter and res.label.value != sentiment_filter:
-            continue
-        items.append(
-            CommentSentimentItem(
-                comment_id=doc.get("platform_id", ""),
-                author=doc.get("author", "anonymous"),
-                body=doc.get("body", ""),
-                published_at=doc.get("published_at"),
-                sentiment_label=res.label.value,
-                sentiment_score=round(res.score, 4),
-                engine=res.engine,
+    for i, doc in enumerate(docs):
+        stored_label = doc.get("sentiment_label")
+        if stored_label:
+            # Use the pre-computed label stored by the ingestion worker.
+            items.append(
+                CommentSentimentItem(
+                    comment_id=doc.get("platform_id", ""),
+                    author=doc.get("author", "anonymous"),
+                    body=doc.get("body", ""),
+                    published_at=doc.get("published_at"),
+                    sentiment_label=stored_label,
+                    sentiment_score=0.0,
+                    engine="stored",
+                )
             )
-        )
-        if len(items) >= page_size:
-            break
+        elif i in live_results:
+            res = live_results[i]
+            items.append(
+                CommentSentimentItem(
+                    comment_id=doc.get("platform_id", ""),
+                    author=doc.get("author", "anonymous"),
+                    body=doc.get("body", ""),
+                    published_at=doc.get("published_at"),
+                    sentiment_label=res.label.value,
+                    sentiment_score=round(res.score, 4),
+                    engine=res.engine,
+                )
+            )
 
     return items
 
@@ -257,7 +312,10 @@ async def trigger_youtube_ingest(channel_id: str) -> TaskEnqueuedResponse:
     backend for completion status.
     """
     try:
-        task = tasks_ingest_youtube_data.delay(channel_id)
+        task = celery_app.send_task(
+            "app.tasks.ingestion_tasks.tasks_ingest_youtube_data",
+            args=[channel_id],
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

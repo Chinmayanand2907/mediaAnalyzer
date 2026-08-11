@@ -35,19 +35,19 @@ export const fetchYoutubeChannels = (signal) =>
   api.get('/youtube/channels', { signal });
 
 export const fetchYoutubeChannel = (channelId, signal) =>
-  api.get(`/youtube/channels/${channelId}`, { signal });
+  api.get(`/youtube/channels/${encodeURIComponent(channelId)}`, { signal });
 
 export const fetchYoutubeSentiment = (channelId, limit = 200, signal) =>
-  api.get(`/youtube/channels/${channelId}/sentiment`, { params: { limit }, signal });
+  api.get(`/youtube/channels/${encodeURIComponent(channelId)}/sentiment`, { params: { limit }, signal });
 
 export const fetchYoutubeComments = (channelId, page = 1, pageSize = 20, sentimentFilter = null, signal) =>
-  api.get(`/youtube/channels/${channelId}/comments`, {
+  api.get(`/youtube/channels/${encodeURIComponent(channelId)}/comments`, {
     params: { page, page_size: pageSize, ...(sentimentFilter && { sentiment_filter: sentimentFilter }) },
     signal,
   });
 
 export const triggerYoutubeIngest = (channelId) =>
-  api.post(`/youtube/channels/${channelId}/ingest`);
+  api.post(`/youtube/channels/${encodeURIComponent(channelId)}/ingest`);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Reddit
@@ -57,22 +57,22 @@ export const fetchRedditSubreddits = (signal) =>
   api.get('/reddit/subreddits', { signal });
 
 export const fetchRedditSubreddit = (subredditName, signal) =>
-  api.get(`/reddit/subreddits/${subredditName}`, { signal });
+  api.get(`/reddit/subreddits/${encodeURIComponent(subredditName)}`, { signal });
 
 export const fetchRedditSentiment = (subredditName, limit = 200, signal) =>
-  api.get(`/reddit/subreddits/${subredditName}/sentiment`, { params: { limit }, signal });
+  api.get(`/reddit/subreddits/${encodeURIComponent(subredditName)}/sentiment`, { params: { limit }, signal });
 
 export const fetchRedditComments = (subredditName, page = 1, pageSize = 20, sentimentFilter = null, signal) =>
-  api.get(`/reddit/subreddits/${subredditName}/comments`, {
+  api.get(`/reddit/subreddits/${encodeURIComponent(subredditName)}/comments`, {
     params: { page, page_size: pageSize, ...(sentimentFilter && { sentiment_filter: sentimentFilter }) },
     signal,
   });
 
 export const fetchRedditKeywords = (subredditName, limit = 200, topN = 20, signal) =>
-  api.get(`/reddit/subreddits/${subredditName}/keywords`, { params: { limit, top_n: topN }, signal });
+  api.get(`/reddit/subreddits/${encodeURIComponent(subredditName)}/keywords`, { params: { limit, top_n: topN }, signal });
 
 export const triggerRedditIngest = (subredditName) =>
-  api.post(`/reddit/subreddits/${subredditName}/ingest`);
+  api.post(`/reddit/subreddits/${encodeURIComponent(subredditName)}/ingest`);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Cross-Platform
@@ -83,6 +83,9 @@ export const fetchEngagementComparison = (signal) =>
 
 export const fetchSharedVideos = (subredditName, limit = 500, signal) =>
   api.get('/cross-platform/shared-videos', { params: { subreddit_name: subredditName, limit }, signal });
+
+export const fetchTopVideos = (topic, maxResults = 10, signal) =>
+  api.get('/cross-platform/top-videos', { params: { topic, max_results: maxResults }, signal });
 
 export const fetchCorrelationSummary = (subredditName, commentScanLimit = 300, signal) =>
   api.get('/cross-platform/correlation-summary', {

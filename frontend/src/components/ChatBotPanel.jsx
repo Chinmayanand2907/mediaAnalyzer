@@ -228,8 +228,15 @@ export default function ChatBotPanel({ platform }) {
               <Sparkles size={16} color="#fff" />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
                 AI Analyst
+                <span style={{
+                  fontSize: 9, fontWeight: 700, letterSpacing: '0.05em',
+                  padding: '2px 6px', borderRadius: 5,
+                  background: 'rgba(34,197,94,0.15)',
+                  border: '1px solid rgba(34,197,94,0.35)',
+                  color: '#22c55e',
+                }}>LIVE DATA</span>
               </div>
               <div style={{
                 fontSize: 11, color: meta.accent, fontWeight: 600,
@@ -363,7 +370,10 @@ export default function ChatBotPanel({ platform }) {
               </button>
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, textAlign: 'center' }}>
-            Powered by Groq Cloud · Press Enter to send · Shift+Enter for new line
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+              <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 4px #22c55e', display: 'inline-block' }} />
+              Live DB data · Groq LLaMA 3.3 70B · Enter to send
+            </span>
             </div>
           </div>
         </div>

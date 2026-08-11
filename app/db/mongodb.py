@@ -42,33 +42,37 @@ _client: AsyncIOMotorClient | None = None
 # ─── Lifecycle Functions ─────────────────────────────────────────
 
 async def connect_mongo() -> None:
-    """Initialize the Motor client and verify connectivity.
-
-    Call once during application startup (e.g. inside the FastAPI
-    lifespan handler).  The underlying connection pool is created
-    lazily by Motor, but issuing a ``ping`` command here lets us
-    fail fast if MongoDB is unreachable.
-    """
+    """Initialize the Motor client and verify connectivity."""
     global _client
+    if _client is not None:
+        try:
+            await _client.admin.command("ping")
+            return
+        except Exception:
+            try:
+                _client.close()
+            except Exception:
+                pass
+            _client = None
+
     _client = AsyncIOMotorClient(
         settings.MONGO_URI,
         maxPoolSize=50,              # max connections in the pool
-        minPoolSize=5,               # keep at least 5 connections warm
-        serverSelectionTimeoutMS=5000,  # fail fast if host is unreachable
+        minPoolSize=1,               # keep at least 1 connection warm
+        serverSelectionTimeoutMS=5000,  # 5s timeout
+        connectTimeoutMS=5000,
         tlsCAFile=certifi.where(),   # load trusted root certs (crucial for macOS/Atlas)
     )
 
-    # Verify the server is reachable (raises on failure)
-    await _client.admin.command("ping")
-    print(f"✅  MongoDB connected → {settings.MONGO_URI}/{settings.MONGO_DB}")
+    try:
+        await _client.admin.command("ping")
+        print(f"✅  MongoDB connected → {settings.MONGO_URI}/{settings.MONGO_DB}")
+    except Exception as e:
+        print(f"⚠️  MongoDB connection warning (will retry lazily on query): {e}")
 
 
 async def close_mongo() -> None:
-    """Gracefully close the Motor client.
-
-    Call during application shutdown to release all pooled
-    connections.
-    """
+    """Gracefully close the Motor client."""
     global _client
     if _client is not None:
         _client.close()
@@ -76,17 +80,17 @@ async def close_mongo() -> None:
         print("🛑  MongoDB connection closed.")
 
 
-# ─── Database & Collection Accessors ─────────────────────────────
-
 def get_mongo_db() -> AsyncIOMotorDatabase:
-    """Return the configured MongoDB database handle.
-
-    Raises ``RuntimeError`` if called before ``connect_mongo()``.
-    """
+    """Return the configured MongoDB database handle."""
+    global _client
     if _client is None:
-        raise RuntimeError(
-            "MongoDB client is not initialized. "
-            "Call 'connect_mongo()' during application startup first."
+        _client = AsyncIOMotorClient(
+            settings.MONGO_URI,
+            maxPoolSize=50,
+            minPoolSize=1,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            tlsCAFile=certifi.where(),
         )
     return _client[settings.MONGO_DB]
 

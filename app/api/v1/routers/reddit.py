@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import string
+from datetime import datetime, timezone
 from collections import Counter
 from typing import List, Optional
 
@@ -34,7 +35,7 @@ from app.api.v1.schemas import (
 from app.db.mongodb import get_comments_collection, get_video_payloads_collection
 from app.db.postgres import Platform, PlatformAccount, get_db_session
 from app.services.analytics.sentiment_service import SentimentService
-from app.tasks.ingestion_tasks import tasks_ingest_reddit_data
+from app.core.celery_app import celery_app
 
 router = APIRouter(prefix="/reddit", tags=["Reddit"])
 
@@ -47,11 +48,30 @@ _STOPWORDS = frozenset(
     "not no nor so yet both either neither one two three i me my we our you your "
     "he she it its they them their this that these those what which who whom how "
     "when where why than then also just more very much many some any all each "
-    "about after before between into through during again further once".split()
+    "about after before between into through during again further once "
+    # URL scheme / structural fragments
+    "http https www ftp "
+    # Generic TLDs and domain noise
+    "com net org edu gov io co uk de fr au ca "
+    # Platform-specific path fragments that appear after punctuation stripping
+    "youtube watch reddit youtu imgur twitter facebook instagram tiktok "
+    "amp utm ref source medium campaign "
+    # Single/double chars that slip through min-length check after URL stripping
+    "ve re ll ve".split()
 )
+
+# Pre-compiled regex that matches any token that looks like a URL.
+_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _as_utc(dt: datetime) -> datetime:
+    """Return *dt* as a timezone-aware UTC datetime regardless of its original tzinfo."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
 
 def _subreddit_not_found(name: str) -> HTTPException:
     return HTTPException(
@@ -62,12 +82,22 @@ def _subreddit_not_found(name: str) -> HTTPException:
 
 
 def _extract_keywords(texts: List[str], top_n: int = 20) -> List[KeywordItem]:
-    """Simple frequency-based keyword extraction from a list of comment bodies."""
+    """Simple frequency-based keyword extraction from a list of comment bodies.
+
+    URLs are stripped before tokenisation so that link fragments (``https``,
+    ``watch``, ``v``, ``t.co``, etc.) never reach the word count.  The
+    expanded ``_STOPWORDS`` set provides a second layer of defence for any
+    domain tokens that survive punctuation stripping.
+    """
     translator = str.maketrans("", "", string.punctuation)
     word_counts: Counter = Counter()
 
     for text in texts:
-        words = text.lower().translate(translator).split()
+        # Layer 1 — remove full URLs before doing anything else.
+        clean = _URL_RE.sub(" ", text)
+        # Layer 2 — strip punctuation, lowercase, split.
+        words = clean.lower().translate(translator).split()
+        # Layer 3 — stopword filter + minimum token length.
         filtered = [w for w in words if len(w) > 3 and w not in _STOPWORDS]
         word_counts.update(filtered)
 
@@ -135,14 +165,31 @@ async def get_subreddit(
         {"platform": "reddit", "platform_id": subreddit_name},
         {"_id": 0, "stats": 1, "ingested_at": 1},
     )
-    ingested_at = (payload_doc or {}).get("ingested_at")
+    mongo_ingested = (payload_doc or {}).get("ingested_at")
+    pg_updated = account.updated_at
+
+    # Normalise both timestamps to aware UTC before comparing.
+    if mongo_ingested is not None:
+        m_dt: datetime | None = _as_utc(mongo_ingested)
+    else:
+        m_dt = None
+
+    if pg_updated is not None:
+        pg_dt: datetime | None = _as_utc(pg_updated)
+    else:
+        pg_dt = None
+
+    if pg_dt is not None and m_dt is not None:
+        last_ingested = pg_dt if pg_dt > m_dt else m_dt
+    else:
+        last_ingested = pg_dt or m_dt
 
     return RedditSubredditMetrics(
         subreddit_name=account.platform_id,
         display_name=account.display_name,
         description=account.description,
         member_count=account.subscriber_count,
-        last_ingested_at=ingested_at.isoformat() if hasattr(ingested_at, "isoformat") else str(ingested_at) if ingested_at else None,
+        last_ingested_at=last_ingested.isoformat() if hasattr(last_ingested, "isoformat") else str(last_ingested) if last_ingested else None,
     )
 
 
@@ -217,46 +264,76 @@ async def get_subreddit_comments(
     Returns a paginated, sentiment-annotated list of subreddit comments.
     Use the `sentiment_filter` query param to show only positive/neutral/negative
     entries in the dashboard comment table.
+
+    When sentiment_filter is provided the query is pushed down to MongoDB
+    (using the ``sentiment_label`` field written by the ingestion worker)
+    so pagination is correct across the full collection.
     """
     comments_coll = get_comments_collection()
     skip = (page - 1) * page_size
-    fetch_size = page_size * 3
+
+    mongo_filter: dict = {"platform": "reddit", "parent_id": subreddit_name}
+    if sentiment_filter:
+        # Only return comments that have been sentiment-labelled and match the filter.
+        mongo_filter["sentiment_label"] = sentiment_filter
 
     cursor = (
         comments_coll
         .find(
-            {"platform": "reddit", "parent_id": subreddit_name},
-            {"_id": 0, "platform_id": 1, "author": 1, "body": 1, "published_at": 1},
+            mongo_filter,
+            {"_id": 0, "platform_id": 1, "author": 1, "body": 1,
+             "published_at": 1, "sentiment_label": 1},
         )
         .sort("ingested_at", -1)
         .skip(skip)
-        .limit(fetch_size)
+        .limit(page_size)
     )
-    docs = await cursor.to_list(length=fetch_size)
+    docs = await cursor.to_list(length=page_size)
 
     if not docs:
         return []
 
-    texts = [d.get("body", "") for d in docs]
-    results = _sentiment_svc.analyze_batch(texts)
+    # Run the sentiment service only on docs that don't yet have a stored label.
+    texts_needed = [
+        (i, d.get("body", ""))
+        for i, d in enumerate(docs)
+        if not d.get("sentiment_label")
+    ]
+    live_results: dict = {}
+    if texts_needed:
+        indices, texts = zip(*texts_needed)
+        results = _sentiment_svc.analyze_batch(list(texts))
+        live_results = dict(zip(indices, results))
 
     items: List[CommentSentimentItem] = []
-    for doc, res in zip(docs, results):
-        if sentiment_filter and res.label.value != sentiment_filter:
-            continue
-        items.append(
-            CommentSentimentItem(
-                comment_id=doc.get("platform_id", ""),
-                author=doc.get("author", "anonymous"),
-                body=doc.get("body", ""),
-                published_at=doc.get("published_at"),
-                sentiment_label=res.label.value,
-                sentiment_score=round(res.score, 4),
-                engine=res.engine,
+    for i, doc in enumerate(docs):
+        stored_label = doc.get("sentiment_label")
+        if stored_label:
+            # Use the pre-computed label stored by the ingestion worker.
+            items.append(
+                CommentSentimentItem(
+                    comment_id=doc.get("platform_id", ""),
+                    author=doc.get("author", "anonymous"),
+                    body=doc.get("body", ""),
+                    published_at=doc.get("published_at"),
+                    sentiment_label=stored_label,
+                    sentiment_score=0.0,
+                    engine="stored",
+                )
             )
-        )
-        if len(items) >= page_size:
-            break
+        elif i in live_results:
+            res = live_results[i]
+            items.append(
+                CommentSentimentItem(
+                    comment_id=doc.get("platform_id", ""),
+                    author=doc.get("author", "anonymous"),
+                    body=doc.get("body", ""),
+                    published_at=doc.get("published_at"),
+                    sentiment_label=res.label.value,
+                    sentiment_score=round(res.score, 4),
+                    engine=res.engine,
+                )
+            )
 
     return items
 
@@ -307,7 +384,10 @@ async def trigger_reddit_ingest(subreddit_name: str) -> TaskEnqueuedResponse:
     MongoDB + Postgres.
     """
     try:
-        task = tasks_ingest_reddit_data.delay(subreddit_name)
+        task = celery_app.send_task(
+            "app.tasks.ingestion_tasks.tasks_ingest_reddit_data",
+            args=[subreddit_name],
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

@@ -2,6 +2,10 @@
 
 Creates a Celery instance pre-configured with Redis broker/backend
 from the central Settings.
+
+This is the canonical Celery app used both by the FastAPI server (to
+enqueue tasks via .delay()) and by the Celery worker process started
+with:  celery -A app.core.celery_app worker
 """
 
 from celery import Celery
@@ -14,6 +18,8 @@ celery_app = Celery(
     "engagement_analyzer",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    # Explicitly include the task modules so the worker picks them up
+    include=["app.tasks.ingestion_tasks"],
 )
 
 celery_app.conf.update(
@@ -23,12 +29,4 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    # Auto-discover tasks inside each sub-package
-    task_routes={
-        "app.services.youtube.tasks.*": {"queue": "youtube"},
-        "app.services.reddit.tasks.*": {"queue": "reddit"},
-    },
 )
-
-# Auto-discover task modules
-celery_app.autodiscover_tasks(["app.services.youtube", "app.services.reddit"])
