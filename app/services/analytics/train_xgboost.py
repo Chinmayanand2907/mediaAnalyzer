@@ -108,11 +108,10 @@ async def _fetch_training_rows_async() -> list[dict]:
         if not account.extra_metadata:
             continue
 
-        try:
-            meta = json.loads(account.extra_metadata)
-        except json.JSONDecodeError:
+        meta = account.extra_metadata
+        if not isinstance(meta, dict):
             logger.warning(
-                "Skipping account %s/%s — malformed extra_metadata JSON.",
+                "Skipping account %s/%s — malformed extra_metadata dict.",
                 account.platform,
                 account.platform_id,
             )

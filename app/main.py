@@ -4,10 +4,16 @@ Run with:
     uvicorn app.main:app --reload
 """
 
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
 from app.db.postgres import init_postgres
@@ -19,23 +25,25 @@ from app.api.v1.routers.reddit import router as reddit_router
 from app.api.v1.routers.cross_platform import router as cross_platform_router
 from app.api.v1.routers.chatbot import router as chatbot_router
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle hook."""
     # ── Startup ──────────────────────────────────────────────
     settings = get_settings()
-    print(f"🚀  Starting {settings.APP_NAME} [{settings.APP_ENV}]")
+    logger.info("🚀  Starting %s [%s]", settings.APP_NAME, settings.APP_ENV)
     await init_postgres()
     try:
         await connect_mongo()
         await ensure_indexes()
     except Exception as e:
-        print(f"⚠️  Mongo initialization warning: {e}")
+        logger.warning("⚠️  Mongo initialization warning: %s", e)
     yield
     # ── Shutdown ─────────────────────────────────────────────
     await close_mongo()
-    print("👋  Shutting down…")
+    logger.info("👋  Shutting down…")
 
 
 settings = get_settings()
@@ -53,17 +61,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS — allow local React dev server ──────────────────────────────────────
+# ── Global exception handler ─────────────────────────────────────────────────
+# Catches any unhandled exception and returns a clean 500 instead of a stack trace.
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error(
+        "Unhandled exception on %s %s: %s",
+        request.method, request.url, exc,
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Origins are loaded from settings.ALLOWED_ORIGINS (env var) so production
+# deployments never need to edit source code.
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",   # React dev (CRA / Vite)
-        "http://localhost:5173",   # Vite default
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Accept"],
 )
 
 # ── Register routers ─────────────────────────────────────────────────────────
@@ -83,9 +106,13 @@ async def health_check():
     return {"status": "ok", "env": settings.APP_ENV, "version": "1.0.0"}
 
 
-@app.get("/api/v1/routes", tags=["ops"], summary="List all registered routes")
+@app.get("/api/v1/routes", tags=["ops"], include_in_schema=False)
 async def list_routes():
-    """Development helper — returns every registered path + method."""
+    """Development helper — returns every registered path + method.
+    Only available when DEBUG=True in settings.
+    """
+    if not settings.DEBUG:
+        raise HTTPException(status_code=404)
     return [
         {"path": route.path, "methods": list(route.methods), "name": route.name}
         for route in app.routes

@@ -527,8 +527,9 @@ class PredictionEngine:
                 baseline_remaining = self._baseline_forecast(
                     working_history, num_posts - step + 1
                 )
-                for br in baseline_remaining:
-                    br["forecast_step"] = len(predictions) + 1
+                # Use enumerate so each remaining step gets a unique sequential number
+                for idx, br in enumerate(baseline_remaining, start=1):
+                    br["forecast_step"] = len(predictions) + idx
                     predictions.append(br)
                 break
 
@@ -607,7 +608,7 @@ class PredictionEngine:
     ) -> Dict[str, Any]:
         """Build a minimal synthetic history record from a forecast result."""
         return {
-            "published_at": pd.Timestamp.utcnow().isoformat(),
+            "published_at": pd.Timestamp.now(tz="UTC").isoformat(),
             "engagement_metrics": {
                 "views":    pred_views,
                 "likes":    pred_likes,

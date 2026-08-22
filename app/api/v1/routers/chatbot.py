@@ -31,12 +31,12 @@ from collections import Counter
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, status
-from openai import AsyncOpenAI, APIConnectionError, AuthenticationError
+from openai import AsyncOpenAI, APIConnectionError, AuthenticationError, RateLimitError
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
 from app.db.mongodb import get_comments_collection, get_video_payloads_collection, get_mongo_db
-from app.db.postgres import Platform, PlatformAccount, get_db_session
+from app.db.postgres import Platform, PlatformAccount, AsyncSessionLocal
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
 
@@ -91,11 +91,10 @@ async def _fetch_youtube_context() -> str:
         comments_coll = get_comments_collection()
 
         # --- PostgreSQL: get all tracked YouTube channels ---
-        engine_ctx = get_db_session()
         channels_data = []
+        from sqlalchemy import select as sa_select  # noqa: PLC0415
 
-        async for session in engine_ctx:
-            from sqlalchemy import select as sa_select
+        async with AsyncSessionLocal() as session:
             stmt = sa_select(PlatformAccount).where(
                 PlatformAccount.platform == Platform.YOUTUBE
             )
@@ -107,7 +106,6 @@ async def _fetch_youtube_context() -> str:
                     "name": acc.display_name or acc.platform_id,
                     "subscribers": acc.subscriber_count,
                 })
-            break
 
         if not channels_data:
             return "No YouTube channels are currently being tracked in the database."
@@ -141,7 +139,7 @@ async def _fetch_youtube_context() -> str:
             bodies = [d.get("body", "") for d in sample_docs]
             keywords = _extract_keywords(bodies, top_n=5) if bodies else []
 
-            # Sentiment counts from sentiment_label field
+            # Sentiment counts — YouTube comments use sentiment_label field
             pos_count = await comments_coll.count_documents(
                 {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "positive"}
             )
@@ -152,6 +150,11 @@ async def _fetch_youtube_context() -> str:
                 {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "neutral"}
             )
             analyzed = pos_count + neg_count + neu_count
+            # Fall back to processed count if labels not yet assigned
+            if analyzed == 0:
+                analyzed = await comments_coll.count_documents(
+                    {"platform": "youtube", "parent_id": chan_id, "sentiment_processed": True}
+                )
 
             lines.append(f"\n  Channel: {name} (ID: {chan_id})")
             lines.append(f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}")
@@ -185,11 +188,10 @@ async def _fetch_reddit_context() -> str:
         comments_coll = get_comments_collection()
 
         # PostgreSQL: all tracked subreddits
-        engine_ctx = get_db_session()
+        from sqlalchemy import select as sa_select  # noqa: PLC0415
         subreddits_data = []
 
-        async for session in engine_ctx:
-            from sqlalchemy import select as sa_select
+        async with AsyncSessionLocal() as session:
             stmt = sa_select(PlatformAccount).where(
                 PlatformAccount.platform == Platform.REDDIT
             )
@@ -201,7 +203,6 @@ async def _fetch_reddit_context() -> str:
                     "name": acc.display_name or acc.platform_id,
                     "members": acc.subscriber_count,
                 })
-            break
 
         if not subreddits_data:
             return "No subreddits are currently being tracked in the database."
@@ -235,7 +236,7 @@ async def _fetch_reddit_context() -> str:
             bodies = [d.get("body", "") for d in sample_docs]
             keywords = _extract_keywords(bodies, top_n=8) if bodies else []
 
-            # Sentiment
+            # Sentiment — Reddit comments use sentiment_label OR sentiment_processed flag
             pos_count = await comments_coll.count_documents(
                 {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "positive"}
             )
@@ -246,6 +247,11 @@ async def _fetch_reddit_context() -> str:
                 {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "neutral"}
             )
             analyzed = pos_count + neg_count + neu_count
+            if analyzed == 0:
+                # Fall back: use count of processed docs if labels not yet populated
+                analyzed = await comments_coll.count_documents(
+                    {"platform": "reddit", "parent_id": sub_id, "sentiment_processed": True}
+                )
 
             lines.append(f"\n  r/{name} (internal ID: {sub_id})")
             lines.append(f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}")
@@ -275,6 +281,11 @@ async def _fetch_reddit_context() -> str:
 PlatformContext = Literal["youtube", "reddit", "cross-platform"]
 
 
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatbotRequest(BaseModel):
     question: str = Field(
         ...,
@@ -287,6 +298,10 @@ class ChatbotRequest(BaseModel):
         ...,
         description="Active dashboard platform: 'youtube' | 'reddit' | 'cross-platform'",
         examples=["youtube"],
+    )
+    history: list[ChatMessage] = Field(
+        default=[],
+        description="Previous conversation turns (up to 6) for multi-turn support",
     )
 
 
@@ -324,9 +339,12 @@ def _build_system_prompt(context: str, live_data: str) -> str:
         "- You have been given REAL, LIVE data from the user's actual database below.\n"
         "- ALWAYS use this real data to answer questions — never invent or fabricate numbers.\n"
         "- If a specific metric shows 'N/A', it means it hasn't been ingested yet; say so clearly.\n"
+        "- For Reddit: sentiment may show only a processed count (not a pos/neg breakdown) — if so, say 'sentiment analysis has run on X comments but label breakdown is pending'.\n"
         "- Give concise, data-informed, actionable advice based strictly on the numbers provided.\n"
-        "- Keep answers under 300 words unless a detailed breakdown is explicitly requested.\n"
-        "- If the user asks about something not in the data, say what data IS available.\n"
+        "- Do NOT give generic social media advice unrelated to the live data shown.\n"
+        "- Keep answers under 400 words unless a detailed breakdown is explicitly requested.\n"
+        "- If the user asks about something not in the data, clearly state what data IS available and suggest running an ingestion.\n"
+        "- You are having a conversation — remember earlier messages in this chat.\n"
     )
 
     return (
@@ -389,32 +407,46 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
         base_url="https://api.groq.com/openai/v1",
     )
 
-    model = "llama-3.3-70b-versatile"
+    model = settings.GROQ_MODEL
+
+    # Build messages list: system + prior history (last 6 turns) + current question
+    history_msgs = [
+        {"role": m.role, "content": m.content}
+        for m in payload.history[-6:]
+    ]
 
     try:
         completion = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
+                *history_msgs,
                 {"role": "user",   "content": payload.question},
             ],
-            temperature=0.4,   # lower temp → more factual, less creative
-            max_tokens=512,
+            temperature=0.4,
+            max_tokens=800,  # increased from 512 to avoid truncated answers
         )
     except AuthenticationError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid GROQ_API_KEY. Please verify your key at https://console.groq.com",
         )
-    except APIConnectionError as exc:
+    except RateLimitError:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Groq API rate limit reached. Please wait a moment and try again.",
+        )
+    except APIConnectionError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Could not connect to the Groq API: {exc}",
+            detail="Could not connect to the Groq API. Please try again later.",
         )
     except Exception as exc:
+        import logging as _logging
+        _logging.getLogger(__name__).error("Unexpected LLM error: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error from LLM: {exc}",
+            detail="An unexpected error occurred. Please try again.",
         )
 
     answer = completion.choices[0].message.content or "No response generated."

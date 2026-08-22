@@ -153,7 +153,12 @@ export default function ChatBotPanel({ platform }) {
       const res = await fetch('/api/v1/chatbot/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, context: platform }),
+        body: JSON.stringify({
+          question,
+          context: platform,
+          // Send last 6 turns as history for multi-turn context
+          history: messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
+        }),
       });
 
       if (!res.ok) {
@@ -372,7 +377,7 @@ export default function ChatBotPanel({ platform }) {
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, textAlign: 'center' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 4px #22c55e', display: 'inline-block' }} />
-              Live DB data · Groq LLaMA 3.3 70B · Enter to send
+              Live DB data · Groq Cloud LLM · Enter to send
             </span>
             </div>
           </div>

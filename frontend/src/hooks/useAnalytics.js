@@ -1,43 +1,76 @@
 /**
- * useAnalytics — generic data-fetching hook.
+ * useAnalytics — generic data-fetching hook with in-memory caching and stale-while-revalidate.
  *
- * Usage:
- *   const { data, loading, error, refetch } = useAnalytics(
- *     (signal) => fetchYoutubeChannels(signal),
- *     []
- *   );
- *
+ * Features:
+ * - Global in-memory cache: metrics, charts, and tables display instantly on tab switches.
+ * - Stale-while-revalidate: renders cached data immediately, revalidates in the background.
  * - Cancels in-flight requests via AbortController when deps change or component unmounts.
- * - Exposes a `refetch` callback for manual refresh (e.g. after triggering an ingest).
- * - `enabled` flag lets callers gate the fetch on a condition (e.g. requires a channel ID).
- *
- * Stability note
- * --------------
- * Callers often pass inline array literals as deps (e.g. [selectedSub]).  Spreading
- * those directly into useCallback's dependency array would cause a new array reference
- * on every render, regenerating the callback and triggering a redundant network request
- * each time.  Instead we compare the dep values by value via a ref and only increment a
- * stable integer counter when something actually changes.  useCallback depends on that
- * counter, so it stays stable across renders where the dep values are the same.
+ * - Exposes `refetch({ force: true })` for manual refresh (e.g. after triggering ingest).
+ * - Stable deps comparison prevents redundant renders.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 
-export function useAnalytics(fetchFn, deps = [], { enabled = true, initialData = null } = {}) {
-  const [data, setData]       = useState(initialData);
-  const [loading, setLoading] = useState(false);
-  const [error, setError]     = useState(null);
-  const fetchFnRef            = useRef(fetchFn);
+/**
+ * Global In-Memory Analytics Cache.
+ * Key: string -> Value: { data: any, timestamp: number }
+ */
+export const analyticsMemoryCache = new Map();
+const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes cache TTL
+
+/**
+ * Generate a deterministic cache key based on function identifier & serialized deps.
+ */
+function createCacheKey(fetchFn, deps, customKey) {
+  if (customKey) return `custom:${customKey}`;
+  const fnId = fetchFn?.name || fetchFn?.toString()?.slice(0, 80)?.replace(/\s+/g, ' ') || 'fn';
+  const depsKey = JSON.stringify(deps || []);
+  return `${fnId}::${depsKey}`;
+}
+
+/**
+ * Clears all or matching entries in the analytics memory cache.
+ */
+export function clearAnalyticsCache(pattern) {
+  if (!pattern) {
+    analyticsMemoryCache.clear();
+    return;
+  }
+  for (const key of analyticsMemoryCache.keys()) {
+    if (key.includes(pattern)) {
+      analyticsMemoryCache.delete(key);
+    }
+  }
+}
+
+export function useAnalytics(
+  fetchFn,
+  deps = [],
+  {
+    enabled = true,
+    initialData = null,
+    cacheKey = null,
+    ttl = DEFAULT_TTL_MS,
+    useCache = true,
+    staleWhileRevalidate = true,
+  } = {}
+) {
+  const key = useCache && enabled ? createCacheKey(fetchFn, deps, cacheKey) : null;
+  const cached = key ? analyticsMemoryCache.get(key) : null;
+  const isFresh = cached != null && (Date.now() - cached.timestamp < ttl);
+
+  const [data, setData] = useState(() => (cached != null ? cached.data : initialData));
+  const [loading, setLoading] = useState(() => (cached == null && enabled));
+  const [error, setError] = useState(null);
+  const fetchFnRef = useRef(fetchFn);
 
   // Keep the ref fresh without triggering re-runs.
-  useEffect(() => { fetchFnRef.current = fetchFn; });
+  useEffect(() => {
+    fetchFnRef.current = fetchFn;
+  });
 
   // ── Stable deps counter ─────────────────────────────────────────────────
-  // Compare the deps array element-by-element on every render.  Only when a
-  // value actually changes do we bump the counter, which is the sole primitive
-  // that useCallback depends on (together with `enabled`).  This means callers
-  // can safely pass inline array literals without causing extra fetches.
-  const prevDepsRef    = useRef(deps);
+  const prevDepsRef = useRef(deps);
   const depsCounterRef = useRef(0);
 
   const prevDeps = prevDepsRef.current;
@@ -51,18 +84,39 @@ export function useAnalytics(fetchFn, deps = [], { enabled = true, initialData =
   const depsCounter = depsCounterRef.current;
   // ───────────────────────────────────────────────────────────────────────
 
-  const run = useCallback((signal) => {
+  const run = useCallback((signal, { force = false } = {}) => {
     if (!enabled) return;
-    setLoading(true);
+
+    const currentKey = useCache ? createCacheKey(fetchFnRef.current, deps, cacheKey) : null;
+    const currentCached = currentKey ? analyticsMemoryCache.get(currentKey) : null;
+    const hasCachedData = currentCached != null;
+    const isCacheValid = !force && hasCachedData && (Date.now() - currentCached.timestamp < ttl);
+
+    if (hasCachedData && !force) {
+      setData(currentCached.data);
+      setLoading(false);
+      if (isCacheValid && !staleWhileRevalidate) {
+        return;
+      }
+    } else {
+      setLoading(true);
+    }
+
     setError(null);
     fetchFnRef.current(signal)
-      .then((result) => { setData(result); setLoading(false); })
+      .then((result) => {
+        if (currentKey && useCache && result !== undefined) {
+          analyticsMemoryCache.set(currentKey, { data: result, timestamp: Date.now() });
+        }
+        setData(result);
+        setLoading(false);
+      })
       .catch((err) => {
-        if (err.name === 'CanceledError' || err.name === 'AbortError') return; // stale request — ignore
+        if (err.name === 'CanceledError' || err.name === 'AbortError') return;
         setError(err.message ?? 'Something went wrong');
         setLoading(false);
       });
-  }, [enabled, depsCounter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [enabled, depsCounter, ttl, useCache, staleWhileRevalidate, cacheKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const controller = new AbortController();
@@ -70,10 +124,11 @@ export function useAnalytics(fetchFn, deps = [], { enabled = true, initialData =
     return () => controller.abort();
   }, [run]);
 
-  const refetch = useCallback(() => {
+  const refetch = useCallback((options = { force: true }) => {
     const controller = new AbortController();
-    run(controller.signal);
+    run(controller.signal, options);
   }, [run]);
 
   return { data, loading, error, refetch };
 }
+

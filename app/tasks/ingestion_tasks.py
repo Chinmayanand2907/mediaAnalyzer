@@ -50,8 +50,8 @@ def _make_motor_client() -> AsyncIOMotorClient:
         settings.MONGO_URI,
         maxPoolSize=10,               # modest pool — this client is short-lived
         minPoolSize=0,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=5000,
+        serverSelectionTimeoutMS=15000,  # wait longer for Atlas primary election
+        connectTimeoutMS=10000,
         tlsCAFile=certifi.where(),
     )
 
@@ -111,8 +111,13 @@ async def _ingest_youtube_data_async(channel_id: str) -> None:
             except Exception as e:
                 logger.debug(f"Username lookup failed: {e}")
 
-            # Strategy D: Search channel by query
+            # Strategy D: Search channel by query (costs 100 quota units — last resort)
             try:
+                logger.warning(
+                    "Falling back to search.list for '%s' — costs 100 quota units. "
+                    "Pass the channel ID directly to avoid this.",
+                    clean_input,
+                )
                 s_req = yt._service.search().list(
                     part="snippet",
                     q=clean_input,
@@ -490,19 +495,60 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
         db = client[settings.MONGO_DB]
         comments_coll = db["comments"]
 
-        # ── 1. Fetch unprocessed comments ────────────────────────────────────
+        # ── 1. Fetch unprocessed comments in batches to avoid OOM ─────────────────
+        # Build cursor but do NOT use to_list(length=None) — that loads everything
+        # into RAM at once alongside the 500 MB RoBERTa model.
+        _SENTIMENT_BATCH = 500
+
         cursor = comments_coll.find(
             {
                 "platform": platform,
                 "parent_id": target_id,
                 "sentiment_processed": {"$ne": True},
             },
-            # Projection: only the fields we need
             {"_id": 1, "body": 1},
         )
-        docs = await cursor.to_list(length=None)
 
-        if not docs:
+        all_doc_ids: list = []
+        all_categories: list[str] = []
+        batch_docs: list = []
+        batch_bulk_ops: list = []
+
+        async def _flush_batch(batch: list) -> None:
+            """Run inference on a batch and bulk-write results."""
+            if not batch:
+                return
+            b_ids = [d["_id"] for d in batch]
+            b_texts = [d.get("body", "") or "" for d in batch]
+            b_cats = _run_roberta_batch(b_texts)
+            all_doc_ids.extend(b_ids)
+            all_categories.extend(b_cats)
+            now_utc_b = datetime.now(timezone.utc)
+            ops = [
+                UpdateOne(
+                    {"_id": doc_id},
+                    {"$set": {
+                        "sentiment_processed": True,
+                        "sentiment_processed_at": now_utc_b,
+                        "sentiment_label": category,
+                    }},
+                )
+                for doc_id, category in zip(b_ids, b_cats)
+            ]
+            if ops:
+                await comments_coll.bulk_write(ops, ordered=False)
+
+        async for doc in cursor:
+            batch_docs.append(doc)
+            if len(batch_docs) >= _SENTIMENT_BATCH:
+                await _flush_batch(batch_docs)
+                batch_docs = []
+
+        # Flush any remaining documents
+        await _flush_batch(batch_docs)
+
+        total = len(all_doc_ids)
+        if total == 0:
             logger.info(
                 "[Sentiment] No unprocessed comments for %s/%s.", platform, target_id
             )
@@ -510,25 +556,14 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
 
         logger.info(
             "[Sentiment] Processing %d comment(s) for %s/%s.",
-            len(docs),
-            platform,
-            target_id,
+            total, platform, target_id,
         )
 
-        # ── 2. Extract text bodies ────────────────────────────────────────────
-        doc_ids = [d["_id"] for d in docs]
-        texts = [d.get("body", "") or "" for d in docs]
-
-        # ── 3. Run through NLP model ──────────────────────────────────────────
-        # _run_roberta_batch auto-falls-back to VADER if RoBERTa isn't loaded
-        categories = _run_roberta_batch(texts)
-
-        # ── 4. Tally counts and compute percentages ───────────────────────────
-        total = len(categories)
+        # ── 4. Tally counts (categories already computed per-batch above) ─────────
         counts = {"positive": 0, "neutral": 0, "negative": 0}
-        for cat in categories:
+        for cat in all_categories:
             counts[cat] += 1
-
+        
         positive_ratio = round(counts["positive"] / total, 4)
         neutral_ratio  = round(counts["neutral"]  / total, 4)
         negative_ratio = round(counts["negative"] / total, 4)
@@ -591,17 +626,10 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                 )
             else:
                 # Merge sentiment scores into the existing extra_metadata JSON blob.
-                existing_meta: dict = {}
-                if account.extra_metadata:
-                    try:
-                        existing_meta = json.loads(account.extra_metadata)
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "[Sentiment] Could not parse existing extra_metadata "
-                            "for %s/%s — overwriting.",
-                            platform,
-                            target_id,
-                        )
+                existing_meta: dict = account.extra_metadata or {}
+                # Ensure it's a dict just in case
+                if not isinstance(existing_meta, dict):
+                    existing_meta = {}
 
                 existing_meta.update(
                     {
@@ -615,7 +643,7 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                         }
                     }
                 )
-                account.extra_metadata = json.dumps(existing_meta)
+                account.extra_metadata = existing_meta
                 account.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 await session.commit()
                 logger.info(
@@ -642,14 +670,24 @@ def tasks_ingest_youtube_data(self, channel_id: str) -> str:
     """
     Celery task to ingest YouTube data.
     """
+    from app.services.external.youtube_client import YouTubeQuotaExceeded  # noqa: PLC0415
+
     logger.info(f"Starting YouTube ingestion task for channel: {channel_id}")
     try:
-        # Since Celery tasks are synchronous, we run the async code using asyncio
         asyncio.run(_ingest_youtube_data_async(channel_id))
         return f"Successfully ingested YouTube data for {channel_id}"
+    except YouTubeQuotaExceeded as exc:
+        # YouTube quota resets at midnight Pacific Time — retrying now wastes
+        # capacity and fills the result backend with RETRY entries.
+        logger.error(
+            "YouTube API quota exceeded for %s — NOT retrying (resets midnight PT): %s",
+            channel_id, exc,
+        )
+        return f"QUOTA_EXCEEDED: {exc}"
     except Exception as exc:
         logger.error(f"Error ingesting YouTube data: {exc}")
-        raise self.retry(exc=exc, countdown=60)
+        # Exponential back-off: 30s → 60s → 120s for attempts 0, 1, 2
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
 
 
 @shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_reddit_data")
@@ -659,12 +697,12 @@ def tasks_ingest_reddit_data(self, subreddit_name: str) -> str:
     """
     logger.info(f"Starting Reddit ingestion task for subreddit: {subreddit_name}")
     try:
-        # Since Celery tasks are synchronous, we run the async code using asyncio
         asyncio.run(_ingest_reddit_data_async(subreddit_name))
         return f"Successfully ingested Reddit data for {subreddit_name}"
     except Exception as exc:
         logger.error(f"Error ingesting Reddit data: {exc}")
-        raise self.retry(exc=exc, countdown=60)
+        # Exponential back-off: 30s → 60s → 120s
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
 
 
 @shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.task_process_sentiment")
@@ -714,4 +752,4 @@ def task_process_sentiment(self, platform: str, target_id: str) -> str:
         logger.error(
             "[Sentiment Task] Error processing %s/%s: %s", platform, target_id, exc
         )
-        raise self.retry(exc=exc, countdown=60)
+        raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)

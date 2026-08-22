@@ -15,13 +15,14 @@ POST /subreddits/{subreddit_name}/ingest      — enqueue async Celery ingestion
 from __future__ import annotations
 
 import re
+import asyncio
 import string
 from datetime import datetime, timezone
 from collections import Counter
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import (
@@ -37,30 +38,52 @@ from app.db.postgres import Platform, PlatformAccount, get_db_session
 from app.services.analytics.sentiment_service import SentimentService
 from app.core.celery_app import celery_app
 
-router = APIRouter(prefix="/reddit", tags=["Reddit"])
+router = APIRouter(prefix="/reddit", tags=["reddit"])
 
-_sentiment_svc = SentimentService()
+# Global sentiment service instance
+_sentiment_svc: SentimentService | None = None
 
-# Common English stopwords for keyword extraction (no external library needed).
-_STOPWORDS = frozenset(
-    "the a an and or but in on at to for of with by from is are was were be been "
-    "being have has had do does did will would could should may might shall can "
-    "not no nor so yet both either neither one two three i me my we our you your "
-    "he she it its they them their this that these those what which who whom how "
-    "when where why than then also just more very much many some any all each "
-    "about after before between into through during again further once "
-    # URL scheme / structural fragments
-    "http https www ftp "
-    # Generic TLDs and domain noise
-    "com net org edu gov io co uk de fr au ca "
-    # Platform-specific path fragments that appear after punctuation stripping
-    "youtube watch reddit youtu imgur twitter facebook instagram tiktok "
-    "amp utm ref source medium campaign "
-    # Single/double chars that slip through min-length check after URL stripping
-    "ve re ll ve".split()
-)
 
-# Pre-compiled regex that matches any token that looks like a URL.
+def _get_sentiment_svc() -> SentimentService:
+    """Return the process-level SentimentService, initializing it once."""
+    global _sentiment_svc
+    if _sentiment_svc is None:
+        _sentiment_svc = SentimentService()
+    return _sentiment_svc
+
+
+def _clean_sub_name(name: str) -> str:
+    """Clean and normalize a subreddit name input."""
+    return name.strip().lstrip('/').replace('r/', '').replace('/r/', '').strip().lower()
+
+
+_STOPWORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+    "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
+    "below", "between", "both", "but", "by", "can't", "cannot", "could", "couldn't",
+    "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down", "during",
+    "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't",
+    "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here",
+    "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i",
+    "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it", "it's",
+    "its", "itself", "let's", "me", "more", "most", "mustn't", "my", "myself",
+    "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought",
+    "our", "ours", "ourselves", "out", "over", "own", "same", "shan't", "she",
+    "she'd", "she'll", "she's", "should", "shouldn't", "so", "some", "such", "than",
+    "that", "that's", "the", "their", "theirs", "them", "themselves", "then",
+    "there", "there's", "these", "they", "they'd", "they'll", "they're", "they've",
+    "this", "those", "through", "to", "too", "under", "until", "up", "very", "was",
+    "wasn't", "we", "we'd", "we'll", "we're", "we've", "were", "weren't", "what",
+    "what's", "when", "when's", "where", "where's", "which", "while", "who", "who's",
+    "whom", "why", "why's", "with", "won't", "would", "wouldn't", "you", "you'd",
+    "you'll", "you're", "you've", "your", "yours", "yourself", "yourselves",
+    # Additional generic / domain stopwords
+    "just", "like", "will", "also", "get", "one", "even", "really", "much", "many",
+    "know", "think", "people", "would", "could", "make", "made", "good", "well",
+    "http", "https", "com", "www", "watch", "youtube", "reddit", "comments",
+}
+
+# Regex to strip full URLs from comment text before word extraction
 _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
 
@@ -82,22 +105,13 @@ def _subreddit_not_found(name: str) -> HTTPException:
 
 
 def _extract_keywords(texts: List[str], top_n: int = 20) -> List[KeywordItem]:
-    """Simple frequency-based keyword extraction from a list of comment bodies.
-
-    URLs are stripped before tokenisation so that link fragments (``https``,
-    ``watch``, ``v``, ``t.co``, etc.) never reach the word count.  The
-    expanded ``_STOPWORDS`` set provides a second layer of defence for any
-    domain tokens that survive punctuation stripping.
-    """
+    """Simple frequency-based keyword extraction from a list of comment bodies."""
     translator = str.maketrans("", "", string.punctuation)
     word_counts: Counter = Counter()
 
     for text in texts:
-        # Layer 1 — remove full URLs before doing anything else.
         clean = _URL_RE.sub(" ", text)
-        # Layer 2 — strip punctuation, lowercase, split.
         words = clean.lower().translate(translator).split()
-        # Layer 3 — stopword filter + minimum token length.
         filtered = [w for w in words if len(w) > 3 and w not in _STOPWORDS]
         word_counts.update(filtered)
 
@@ -149,20 +163,21 @@ async def get_subreddit(
     Combine Postgres account metadata with the latest MongoDB payload snapshot
     to produce a full subreddit metrics card for the dashboard state dropdown.
     """
+    clean_sub = _clean_sub_name(subreddit_name)
     stmt = select(PlatformAccount).where(
         PlatformAccount.platform == Platform.REDDIT,
-        PlatformAccount.platform_id == subreddit_name,
+        func.lower(PlatformAccount.platform_id) == clean_sub,
     )
     result = await session.execute(stmt)
     account = result.scalar_one_or_none()
 
     if account is None:
-        raise _subreddit_not_found(subreddit_name)
+        raise _subreddit_not_found(clean_sub)
 
     # Latest MongoDB snapshot (member count may be fresher here)
     payloads_coll = get_video_payloads_collection()
     payload_doc = await payloads_coll.find_one(
-        {"platform": "reddit", "platform_id": subreddit_name},
+        {"platform": "reddit", "platform_id": {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}},
         {"_id": 0, "stats": 1, "ingested_at": 1},
     )
     mongo_ingested = (payload_doc or {}).get("ingested_at")
@@ -207,19 +222,20 @@ async def get_subreddit_sentiment(
     Run the latest *limit* subreddit comments through SentimentService and
     return an aggregate distribution suited for a dashboard donut chart.
     """
+    clean_sub = _clean_sub_name(subreddit_name)
     stmt = select(PlatformAccount).where(
         PlatformAccount.platform == Platform.REDDIT,
-        PlatformAccount.platform_id == subreddit_name,
+        func.lower(PlatformAccount.platform_id) == clean_sub,
     )
     result = await session.execute(stmt)
     if result.scalar_one_or_none() is None:
-        raise _subreddit_not_found(subreddit_name)
+        raise _subreddit_not_found(clean_sub)
 
     comments_coll = get_comments_collection()
     cursor = (
         comments_coll
         .find(
-            {"platform": "reddit", "parent_id": subreddit_name},
+            {"platform": "reddit", "parent_id": {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}},
             {"_id": 0, "body": 1},
         )
         .sort("ingested_at", -1)
@@ -234,8 +250,9 @@ async def get_subreddit_sentiment(
         )
 
     texts = [d.get("body", "") for d in docs]
-    results = _sentiment_svc.analyze_batch(texts)
-    agg = _sentiment_svc.aggregate_sentiment(results)
+    svc = _get_sentiment_svc()
+    results = await asyncio.to_thread(svc.analyze_batch, texts)
+    agg = svc.aggregate_sentiment(results)
 
     return SentimentDistribution(
         positive=round(agg["positive"], 4),
@@ -255,7 +272,7 @@ async def get_subreddit_comments(
     subreddit_name: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    sentiment_filter: Optional[str] = Query(
+    sentiment_filter: Optional[Literal["positive", "neutral", "negative"]] = Query(
         default=None,
         description="Filter by sentiment label: positive | neutral | negative",
     ),
@@ -269,10 +286,14 @@ async def get_subreddit_comments(
     (using the ``sentiment_label`` field written by the ingestion worker)
     so pagination is correct across the full collection.
     """
+    clean_sub = _clean_sub_name(subreddit_name)
     comments_coll = get_comments_collection()
     skip = (page - 1) * page_size
 
-    mongo_filter: dict = {"platform": "reddit", "parent_id": subreddit_name}
+    mongo_filter: dict = {
+        "platform": "reddit",
+        "parent_id": {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"},
+    }
     if sentiment_filter:
         # Only return comments that have been sentiment-labelled and match the filter.
         mongo_filter["sentiment_label"] = sentiment_filter
@@ -302,7 +323,8 @@ async def get_subreddit_comments(
     live_results: dict = {}
     if texts_needed:
         indices, texts = zip(*texts_needed)
-        results = _sentiment_svc.analyze_batch(list(texts))
+        svc = _get_sentiment_svc()
+        results = await asyncio.to_thread(svc.analyze_batch, list(texts))
         live_results = dict(zip(indices, results))
 
     items: List[CommentSentimentItem] = []
@@ -352,11 +374,12 @@ async def get_subreddit_keywords(
     Extract the most frequently used non-stopword tokens from the latest
     subreddit comments. Useful for word-cloud and trending-topic widgets.
     """
+    clean_sub = _clean_sub_name(subreddit_name)
     comments_coll = get_comments_collection()
     cursor = (
         comments_coll
         .find(
-            {"platform": "reddit", "parent_id": subreddit_name},
+            {"platform": "reddit", "parent_id": {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}},
             {"_id": 0, "body": 1},
         )
         .sort("ingested_at", -1)
@@ -383,6 +406,7 @@ async def trigger_reddit_ingest(subreddit_name: str) -> TaskEnqueuedResponse:
     *subreddit_name* via the Reddit API (PRAW) and store results in
     MongoDB + Postgres.
     """
+    clean_sub = _clean_sub_name(subreddit_name)
     try:
         task = celery_app.send_task(
             "app.tasks.ingestion_tasks.tasks_ingest_reddit_data",

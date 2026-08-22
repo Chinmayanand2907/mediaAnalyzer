@@ -21,6 +21,7 @@ Usage in a FastAPI route::
 """
 
 from __future__ import annotations
+import logging
 
 from motor.motor_asyncio import (
     AsyncIOMotorClient,
@@ -32,8 +33,21 @@ from app.core.config import get_settings
 
 import certifi
 
+logger = logging.getLogger(__name__)
+
 # ─── Settings ────────────────────────────────────────────────────
 settings = get_settings()
+
+# ─── Shared Motor client kwargs ───────────────────────────────────
+# Single source of truth — used by both connect_mongo() and get_mongo_db()
+# so the lazy-init path (e.g. Celery tasks, tests) always has full TLS config.
+_MONGO_CLIENT_KWARGS: dict = dict(
+    maxPoolSize=50,
+    minPoolSize=1,
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=5000,
+    tlsCAFile=certifi.where(),       # trusted root certs — crucial for Atlas / macOS
+)
 
 # ─── Module-level singleton ──────────────────────────────────────
 _client: AsyncIOMotorClient | None = None
@@ -55,20 +69,14 @@ async def connect_mongo() -> None:
                 pass
             _client = None
 
-    _client = AsyncIOMotorClient(
-        settings.MONGO_URI,
-        maxPoolSize=50,              # max connections in the pool
-        minPoolSize=1,               # keep at least 1 connection warm
-        serverSelectionTimeoutMS=5000,  # 5s timeout
-        connectTimeoutMS=5000,
-        tlsCAFile=certifi.where(),   # load trusted root certs (crucial for macOS/Atlas)
-    )
+    _client = AsyncIOMotorClient(settings.MONGO_URI, **_MONGO_CLIENT_KWARGS)
 
     try:
+        # Force a connection check
         await _client.admin.command("ping")
-        print(f"✅  MongoDB connected → {settings.MONGO_URI}/{settings.MONGO_DB}")
+        logger.info(f"✅  MongoDB connected → {settings.MONGO_URI}/{settings.MONGO_DB}")
     except Exception as e:
-        print(f"⚠️  MongoDB connection warning (will retry lazily on query): {e}")
+        logger.warning(f"⚠️  MongoDB connection warning (will retry lazily on query): {e}")
 
 
 async def close_mongo() -> None:
@@ -77,21 +85,19 @@ async def close_mongo() -> None:
     if _client is not None:
         _client.close()
         _client = None
-        print("🛑  MongoDB connection closed.")
+        logger.info("🛑  MongoDB connection closed.")
 
 
 def get_mongo_db() -> AsyncIOMotorDatabase:
-    """Return the configured MongoDB database handle."""
+    """Return the configured MongoDB database handle.
+
+    Uses the same shared _MONGO_CLIENT_KWARGS as connect_mongo() so
+    lazy initialization (called before lifespan, in tests or Celery tasks)
+    always uses the correct TLS certifi configuration.
+    """
     global _client
     if _client is None:
-        _client = AsyncIOMotorClient(
-            settings.MONGO_URI,
-            maxPoolSize=50,
-            minPoolSize=1,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            tlsCAFile=certifi.where(),
-        )
+        _client = AsyncIOMotorClient(settings.MONGO_URI, **_MONGO_CLIENT_KWARGS)
     return _client[settings.MONGO_DB]
 
 
@@ -157,4 +163,4 @@ async def ensure_indexes() -> None:
     await payloads.create_index("platform_id", unique=True)
     await payloads.create_index("ingested_at")
 
-    print("📇  MongoDB indexes ensured.")
+    logger.info("📇  MongoDB indexes ensured.")

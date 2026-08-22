@@ -16,8 +16,17 @@ vi.mock('../api/client', () => ({
   fetchRedditComments: vi.fn(() => Promise.resolve([])),
   fetchEngagementComparison: vi.fn(() => Promise.resolve([])),
   fetchSharedVideos: vi.fn(() => Promise.resolve([])),
+  fetchTopVideos: vi.fn(() => Promise.resolve([])),
+  fetchCrossPlatformSentiment: vi.fn(() => Promise.resolve({
+    youtube_sentiment: { positive: 0.7, neutral: 0.2, negative: 0.1, dominant_label: 'positive', sample_size: 10 },
+    reddit_sentiment: { positive: 0.5, neutral: 0.3, negative: 0.2, dominant_label: 'positive', sample_size: 10 },
+    sentiment_gap: 0.2,
+    audience_response_summary: 'Aligned',
+  })),
+  fetchCrossPlatformTopics: vi.fn(() => Promise.resolve({ shared_topics: [], youtube_topics: [], reddit_topics: [], top_correlations: [] })),
   fetchCorrelationSummary: vi.fn(() => Promise.resolve({})),
 }));
+
 
 describe('Dashboard Component', () => {
   beforeEach(() => {
@@ -59,6 +68,6 @@ describe('Dashboard Component', () => {
     });
 
     // Assert: Cross-Platform view should be visible
-    expect(await screen.findByText(/Global Engagement Index/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Cross-Platform Analysis/i)).toBeInTheDocument();
   });
 });

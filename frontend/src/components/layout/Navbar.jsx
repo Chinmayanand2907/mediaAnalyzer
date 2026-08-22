@@ -63,6 +63,7 @@ export default function Navbar({ platform, onPlatformChange }) {
         {/* ── Platform Dropdown ─────────────────────────────────────────── */}
         <div ref={dropRef} style={{ position: 'relative' }}>
           <button
+            aria-label="Switch platform"
             onClick={() => setOpen((o) => !o)}
             style={{
               display: 'flex', alignItems: 'center', gap: 8,

@@ -14,7 +14,8 @@ from sqlmodel import SQLModel
 # Set test environment variable so get_settings() returns test config
 os.environ["APP_ENV"] = "development"
 os.environ["REDIS_URL"] = "redis://localhost:6379/1"
-os.environ["POSTGRES_DSN"] = "sqlite+aiosqlite:///:memory:"
+# NOTE: POSTGRES_DSN is a @computed_field in Settings — it cannot be overridden
+# via env var. The test DB engine below is wired directly via dependency_overrides.
 os.environ["MONGO_URI"] = "mongodb://localhost:27017"
 os.environ["YOUTUBE_API_KEY"] = "test_yt_key"
 os.environ["REDDIT_CLIENT_ID"] = "test_reddit_client"
@@ -25,14 +26,8 @@ from app.db.postgres import get_db_session
 from app.db import mongodb
 
 # ─── Async Test Environment Setup ──────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create an instance of the default event loop for each test case."""
-    policy = asyncio.get_event_loop_policy()
-    loop = policy.new_event_loop()
-    yield loop
-    loop.close()
+# asyncio_mode = "auto" is set in pytest.ini — no need for a manual event_loop fixture.
+# The deprecated @pytest.fixture(scope="session") event_loop pattern is removed.
 
 # ─── Database Fixtures ────────────────────────────────────────────────────────
 

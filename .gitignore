@@ -32,5 +32,6 @@ Thumbs.db
 *.pt
 *.bin
 
-# Logs
+# Logs & DB dumps
 *.log
+*.rdb

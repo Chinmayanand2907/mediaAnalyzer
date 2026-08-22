@@ -325,14 +325,16 @@ class YouTubeClient:
         ChannelVideosResponse
             List of video stubs with a ``next_page_token`` for pagination.
         """
-        request = self._service.search().list(
+        kwargs: dict = dict(
             part="snippet",
             channelId=channel_id,
             type="video",
             order=order,
             maxResults=min(max_results, 50),
-            pageToken=page_token or "",
         )
+        if page_token:
+            kwargs["pageToken"] = page_token
+        request = self._service.search().list(**kwargs)
         data = await self._execute_with_retry(request)
 
         videos: list[ChannelVideoItem] = []
@@ -386,13 +388,15 @@ class YouTubeClient:
         CommentThreadsResponse
             Threads with nested replies and a ``next_page_token``.
         """
-        request = self._service.commentThreads().list(
+        kwargs: dict = dict(
             part="snippet,replies",
             videoId=video_id,
             order=order,
             maxResults=min(max_results, 100),
-            pageToken=page_token or "",
         )
+        if page_token:
+            kwargs["pageToken"] = page_token
+        request = self._service.commentThreads().list(**kwargs)
         data = await self._execute_with_retry(request)
 
         threads: list[CommentThread] = []

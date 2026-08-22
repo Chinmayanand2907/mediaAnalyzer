@@ -18,9 +18,10 @@ All DB reads use:
 from __future__ import annotations
 
 import re
+import asyncio
 from datetime import datetime, timezone
 from collections import Counter
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -40,8 +41,17 @@ from app.core.celery_app import celery_app
 
 router = APIRouter(prefix="/youtube", tags=["YouTube"])
 
-# Module-level singleton so the HuggingFace model loads once.
-_sentiment_svc = SentimentService()
+# Lazy singleton — loaded on first sentiment request, NOT at import time.
+# Prevents 500 MB RoBERTa model from loading in every uvicorn worker at startup.
+_sentiment_svc: SentimentService | None = None
+
+
+def _get_sentiment_svc() -> SentimentService:
+    """Return the process-level SentimentService, initializing it once."""
+    global _sentiment_svc
+    if _sentiment_svc is None:
+        _sentiment_svc = SentimentService()
+    return _sentiment_svc
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -194,8 +204,9 @@ async def get_youtube_sentiment(
         )
 
     texts = [d.get("body", "") for d in docs]
-    results = _sentiment_svc.analyze_batch(texts)
-    agg = _sentiment_svc.aggregate_sentiment(results)
+    svc = _get_sentiment_svc()
+    results = await asyncio.to_thread(svc.analyze_batch, texts)
+    agg = svc.aggregate_sentiment(results)
 
     return SentimentDistribution(
         positive=round(agg["positive"], 4),
@@ -215,7 +226,7 @@ async def get_youtube_comments(
     channel_id: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
-    sentiment_filter: Optional[str] = Query(
+    sentiment_filter: Optional[Literal["positive", "neutral", "negative"]] = Query(
         default=None,
         description="Filter by sentiment label: positive | neutral | negative",
     ),
@@ -261,7 +272,8 @@ async def get_youtube_comments(
     live_results: dict = {}
     if texts_needed:
         indices, texts = zip(*texts_needed)
-        results = _sentiment_svc.analyze_batch(list(texts))
+        svc = _get_sentiment_svc()
+        results = await asyncio.to_thread(svc.analyze_batch, list(texts))
         live_results = dict(zip(indices, results))
 
     items: List[CommentSentimentItem] = []

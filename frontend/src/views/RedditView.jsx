@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { Users, Hash, MessageSquare, Flame, RefreshCw, Layers, PlusCircle } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip, Cell, YAxis } from 'recharts';
 
-import { useAnalytics } from '../hooks/useAnalytics';
+import { useAnalytics, clearAnalyticsCache } from '../hooks/useAnalytics';
 import {
   fetchRedditSubreddits,
   fetchRedditSubreddit,
@@ -85,46 +85,50 @@ export default function RedditView() {
   // Auto-select the first subreddit when data loads if none is selected
   useEffect(() => {
     if (!selectedSub && subreddits && subreddits.length > 0) {
-      setSelectedSub(subreddits[0].platform_id);
+      setSelectedSub(subreddits[0].subreddit_name);
     }
   }, [subreddits, selectedSub]);
 
   const handleIngest = async (subName) => {
-    const target = subName || selectedSub;
-    if (!target) return;
+    const rawTarget = subName || selectedSub;
+    if (!rawTarget) return;
+    const cleanTarget = rawTarget.trim().toLowerCase().replace(/^\/?r\//, '').replace(/\/$/, '');
+    if (!cleanTarget) return;
+
     setIngestLoading(true);
-    setIngestMsg('⏳ Queuing ingestion task...');
+    setIngestMsg(`⏳ Ingesting data for r/${cleanTarget}...`);
+
+    // Switch selected sub immediately so view displays this subreddit
+    setSelectedSub(cleanTarget);
+    setNewSubInput('');
+    setInputMode(false);
+    setPage(1);
+    setSentFilter(null);
+
+    // Clear stale cache for this target and subreddit list
+    clearAnalyticsCache(cleanTarget);
+    clearAnalyticsCache('fetchRedditSubreddits');
+
     try {
-      const res = await triggerRedditIngest(target);
-      setIngestMsg(`⏳ Ingestion started: ${res.message} — Updating metrics...`);
+      const res = await triggerRedditIngest(cleanTarget);
+      setIngestMsg(`⏳ Ingestion in progress: ${res.message} — Fetching latest metrics...`);
 
-      const isNewSub = !selectedSub || selectedSub !== target;
-      if (isNewSub) {
-        setTimeout(() => {
-          setSelectedSub(target);
-          setNewSubInput('');
-          setInputMode(false);
-          setPage(1);
-          setSentFilter(null);
-        }, 1500);
-      }
-
-      // Poll multiple times because Celery tasks can take 10+ seconds
+      // Poll periodically to catch completed Celery tasks
       let pollCount = 0;
       const intervalId = setInterval(() => {
         pollCount += 1;
-        refetchSubreddits();
-        refetchMetrics();
-        refetchSentiment();
-        refetchKeywords();
-        refetchComments();
-        
-        if (pollCount >= 4) {
+        refetchSubreddits({ force: true });
+        refetchMetrics({ force: true });
+        refetchSentiment({ force: true });
+        refetchKeywords({ force: true });
+        refetchComments({ force: true });
+
+        if (pollCount >= 5) {
           clearInterval(intervalId);
-          setIngestMsg('✅ Ingestion complete! Latest data & subreddit timestamp loaded.');
+          setIngestMsg(`✅ Ingestion complete for r/${cleanTarget}! Latest data loaded.`);
           setIngestLoading(false);
         }
-      }, 3500);
+      }, 2500);
     } catch (e) {
       setIngestMsg(`❌ ${e.message}`);
       setIngestLoading(false);

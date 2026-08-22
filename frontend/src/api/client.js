@@ -81,14 +81,48 @@ export const triggerRedditIngest = (subredditName) =>
 export const fetchEngagementComparison = (signal) =>
   api.get('/cross-platform/engagement-comparison', { signal });
 
-export const fetchSharedVideos = (subredditName, limit = 500, signal) =>
-  api.get('/cross-platform/shared-videos', { params: { subreddit_name: subredditName, limit }, signal });
+export const fetchSharedVideos = (subredditName, limit = 500, signal, videoUrlOrId = null) =>
+  api.get('/cross-platform/shared-videos', {
+    params: {
+      ...(subredditName && { subreddit_name: subredditName }),
+      ...(videoUrlOrId && { video_url_or_id: videoUrlOrId }),
+      limit,
+    },
+    signal,
+  });
+
+export const fetchVideoCrossPlatformEngagement = (videoUrlOrId, commentScanLimit = 2000, signal) =>
+  api.get('/cross-platform/video-engagement', {
+    params: { video_url_or_id: videoUrlOrId, comment_scan_limit: commentScanLimit },
+    signal,
+  });
 
 export const fetchTopVideos = (topic, maxResults = 10, signal) =>
   api.get('/cross-platform/top-videos', { params: { topic, max_results: maxResults }, signal });
 
-export const fetchCorrelationSummary = (subredditName, commentScanLimit = 300, signal) =>
-  api.get('/cross-platform/correlation-summary', {
-    params: { subreddit_name: subredditName, comment_scan_limit: commentScanLimit },
+export const fetchCrossPlatformSentiment = (subredditName, signal, videoUrlOrId = null) =>
+  api.get('/cross-platform/sentiment-comparison', {
+    params: {
+      ...(subredditName && { subreddit_name: subredditName }),
+      ...(videoUrlOrId && { video_url_or_id: videoUrlOrId }),
+    },
     signal,
   });
+
+export const fetchCrossPlatformTopics = (subredditName, signal) =>
+  api.get('/cross-platform/topic-correlation', {
+    params: { ...(subredditName && { subreddit_name: subredditName }) },
+    signal,
+  });
+
+export const fetchCorrelationSummary = (subredditName, commentScanLimit = 300, signal, videoUrlOrId = null) =>
+  api.get('/cross-platform/correlation-summary', {
+    params: {
+      ...(subredditName && { subreddit_name: subredditName }),
+      ...(videoUrlOrId && { video_url_or_id: videoUrlOrId }),
+      comment_scan_limit: commentScanLimit,
+    },
+    signal,
+  });
+
+

@@ -24,10 +24,12 @@ import uuid
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
-
+from typing import Optional, Dict, Any
+from pydantic import ConfigDict
+from sqlalchemy import Column, JSON
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 from app.core.config import get_settings
@@ -117,6 +119,11 @@ class PlatformAccount(SQLModel, table=True):
     """
 
     __tablename__ = "platform_accounts"
+    __table_args__ = (
+        # Composite uniqueness: one record per (platform, native_id) pair.
+        # Guards against duplicate rows from concurrent ingestion tasks.
+        UniqueConstraint("platform", "platform_id", name="uq_platform_account"),
+    )
 
     id: uuid.UUID = Field(
         default_factory=uuid.uuid4,
@@ -157,8 +164,9 @@ class PlatformAccount(SQLModel, table=True):
         description="Avatar or icon URL",
     )
 
-    extra_metadata: Optional[str] = Field(
+    extra_metadata: Optional[Dict[str, Any]] = Field(
         default=None,
+        sa_column=Column(JSON),
         description="Arbitrary JSON blob for platform-specific fields",
     )
 

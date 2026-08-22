@@ -108,18 +108,23 @@ class SentimentService:
     def _load_transformer(self) -> None:
         """Try to load the HuggingFace sentiment pipeline."""
         try:
+            import os
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+
             from transformers import pipeline as hf_pipeline
 
-            logger.info("Loading transformer model '%s' …", self.model_name)
+            logger.info("Loading transformer model '%s' on CPU …", self.model_name)
             self._pipeline = hf_pipeline(
                 "sentiment-analysis",
                 model=self.model_name,
                 top_k=None,           # return scores for ALL labels
                 truncation=True,
                 max_length=512,
+                device="cpu",         # CPU prevents macOS Metal/MPS segmentation faults
             )
             self._active_engine = "transformer"
-            logger.info("Transformer model loaded successfully.")
+            logger.info("Transformer model loaded successfully on CPU.")
         except Exception as exc:
             logger.warning(
                 "Could not load transformer model '%s': %s. "

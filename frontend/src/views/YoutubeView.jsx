@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Users, Eye, ThumbsUp, Video, RefreshCw, Play, PlusCircle } from 'lucide-react';
 
-import { useAnalytics } from '../hooks/useAnalytics';
+import { useAnalytics, clearAnalyticsCache } from '../hooks/useAnalytics';
 import {
   fetchYoutubeChannels,
   fetchYoutubeChannel,
@@ -30,7 +30,9 @@ export default function YoutubeView() {
   const [page, setPage]                       = useState(1);
   const [sentFilter, setSentFilter]           = useState(null);
   const [ingestMsg, setIngestMsg]             = useState('');
-  const [ingestLoading, setIngestLoading]     = useState(false);  // ── Channel list ─────────────────────────────────────────────────────────
+  const [ingestLoading, setIngestLoading]     = useState(false);
+
+  // ── Channel list ─────────────────────────────────────────────────────────
   const { data: channels, loading: channelsLoading, refetch: refetchChannels } = useAnalytics(
     (signal) => fetchYoutubeChannels(signal),
     []
@@ -65,40 +67,44 @@ export default function YoutubeView() {
   }, [channels, selectedChannel]);
 
   const handleIngest = async (channelId) => {
-    const target = channelId || selectedChannel;
-    if (!target) return;
-    setIngestLoading(true);
-    setIngestMsg('⏳ Queuing ingestion task...');
-    try {
-      const res = await triggerYoutubeIngest(target);
-      setIngestMsg(`⏳ Ingestion started: ${res.message} — Updating metrics...`);
-      
-      const isNewChannel = !selectedChannel || selectedChannel !== target;
-      if (isNewChannel) {
-        setTimeout(() => {
-          setSelectedChannel(target);
-          setNewChannelInput('');
-          setInputMode(false);
-          setPage(1);
-          setSentFilter(null);
-        }, 1500);
-      }
+    const rawTarget = channelId || selectedChannel;
+    if (!rawTarget) return;
+    const cleanTarget = rawTarget.trim();
+    if (!cleanTarget) return;
 
-      // Poll multiple times because Celery tasks can take 10+ seconds
+    setIngestLoading(true);
+    setIngestMsg(`⏳ Ingesting data for channel ${cleanTarget}...`);
+
+    // Switch selected channel immediately
+    setSelectedChannel(cleanTarget);
+    setNewChannelInput('');
+    setInputMode(false);
+    setPage(1);
+    setSentFilter(null);
+
+    // Invalidate stale cache
+    clearAnalyticsCache(cleanTarget);
+    clearAnalyticsCache('fetchYoutubeChannels');
+
+    try {
+      const res = await triggerYoutubeIngest(cleanTarget);
+      setIngestMsg(`⏳ Ingestion in progress: ${res.message} — Fetching latest metrics...`);
+
+      // Poll periodically to catch completed Celery tasks
       let pollCount = 0;
       const intervalId = setInterval(() => {
         pollCount += 1;
-        refetchChannels();
-        refetchMetrics();
-        refetchSentiment();
-        refetchComments();
-        
-        if (pollCount >= 4) {
+        refetchChannels({ force: true });
+        refetchMetrics({ force: true });
+        refetchSentiment({ force: true });
+        refetchComments({ force: true });
+
+        if (pollCount >= 5) {
           clearInterval(intervalId);
-          setIngestMsg('✅ Ingestion complete! Latest data & channel timestamp loaded.');
+          setIngestMsg(`✅ Ingestion complete for ${cleanTarget}! Latest data loaded.`);
           setIngestLoading(false);
         }
-      }, 3500);
+      }, 2500);
     } catch (e) {
       setIngestMsg(`❌ ${e.message}`);
       setIngestLoading(false);

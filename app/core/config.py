@@ -11,9 +11,9 @@ Usage:
 """
 
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, List
 
-from pydantic import Field, MongoDsn, computed_field
+from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,10 +27,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Application ──────────────────────────────────────────
+    # ── Application ──────────────────────────────────
     APP_NAME: str = "Social Media Engagement Analyzer"
     APP_ENV: Literal["development", "staging", "production"] = "development"
-    DEBUG: bool = True
+    DEBUG: bool = False  # Never default to True — SQL echo leaks queries in production
+
+    # ── CORS ────────────────────────────────────────────────
+    ALLOWED_ORIGINS: List[str] = Field(
+        default=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000"],
+        description="CORS allowed origins. Set via ALLOWED_ORIGINS env var as a JSON array.",
+    )
 
     # ── PostgreSQL ───────────────────────────────────────────
     POSTGRES_USER: str = "analyzer"
@@ -81,6 +87,13 @@ class Settings(BaseSettings):
     GROQ_API_KEY: str = Field(
         default="",
         description="Groq Cloud API key — get one at console.groq.com",
+    )
+    GROQ_MODEL: str = Field(
+        default="groq/compound",
+        description=(
+            "Groq model name used by the chatbot endpoint. "
+            "Override in .env — e.g. GROQ_MODEL=llama-3.3-70b-versatile"
+        ),
     )
 
 
