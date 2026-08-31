@@ -28,8 +28,9 @@ x-backend-env: &backend-env
   REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID}
   REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET}
   REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-EngageLens/3.0}
-  GROQ_API_KEY: ${GROQ_API_KEY}
-  GROQ_MODEL: ${GROQ_MODEL:-groq/compound}
+  GEMINI_API_KEY: ${GEMINI_API_KEY}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+
 
 # ─── Named Volumes ────────────────────────────────────────────────────────────
 volumes:

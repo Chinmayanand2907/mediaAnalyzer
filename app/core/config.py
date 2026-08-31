@@ -83,18 +83,19 @@ class Settings(BaseSettings):
     REDDIT_CLIENT_SECRET: str = Field(default="", description="Reddit OAuth2 secret")
     REDDIT_USER_AGENT: str = "EngagementAnalyzer/1.0"
 
-    # ── Groq Cloud LLM ───────────────────────────────────────────────────────────────
-    GROQ_API_KEY: str = Field(
+    # ── Gemini LLM ───────────────────────────────────────────────────────────
+    GEMINI_API_KEY: str = Field(
         default="",
-        description="Groq Cloud API key — get one at console.groq.com",
+        description="Google Gemini API key — get one at aistudio.google.com",
     )
-    GROQ_MODEL: str = Field(
-        default="groq/compound",
+    GEMINI_MODEL: str = Field(
+        default="gemini-2.5-flash-lite",
         description=(
-            "Groq model name used by the chatbot endpoint. "
-            "Override in .env — e.g. GROQ_MODEL=llama-3.3-70b-versatile"
+            "Gemini model name used by the chatbot endpoint. "
+            "Override in .env — e.g. GEMINI_MODEL=gemini-2.5-flash-lite"
         ),
     )
+
 
 
 @lru_cache

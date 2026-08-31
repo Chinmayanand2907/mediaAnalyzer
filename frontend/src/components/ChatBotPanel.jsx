@@ -377,7 +377,7 @@ export default function ChatBotPanel({ platform }) {
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, textAlign: 'center' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 4px #22c55e', display: 'inline-block' }} />
-              Live DB data · Groq Cloud LLM · Enter to send
+              Live DB data · Google Gemini · Enter to send
             </span>
             </div>
           </div>

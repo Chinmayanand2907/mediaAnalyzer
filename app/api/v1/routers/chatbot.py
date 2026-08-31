@@ -7,7 +7,7 @@ Endpoints
 POST /query   — Accept a user question + active dashboard context, pull
                 REAL-TIME metrics from MongoDB + PostgreSQL, inject them
                 into a dynamic system prompt, and return an AI answer from
-                Groq Cloud (LLaMA 3.3 70B).
+                Google Gemini.
 
 Context → System Prompt mapping
 --------------------------------
@@ -366,7 +366,7 @@ def _build_system_prompt(context: str, live_data: str) -> str:
     description=(
         "Submit a question along with the active dashboard platform context. "
         "The system fetches REAL metrics from MongoDB + PostgreSQL, injects them "
-        "into the system prompt, then calls Groq LLM so answers are based on your "
+        "into the system prompt, then calls Gemini LLM so answers are based on your "
         "actual data — not hallucinated numbers."
     ),
 )
@@ -374,17 +374,17 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     """
     1. Fetch real-time metrics from the database for the given context.
     2. Build a system prompt containing those metrics.
-    3. Call the Groq API with the enriched prompt.
+    3. Call the Gemini API with the enriched prompt.
     4. Return the grounded, data-aware response.
     """
     settings = get_settings()
 
-    if not settings.GROQ_API_KEY:
+    if not settings.GEMINI_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Chatbot is not configured. Please set GROQ_API_KEY in your "
-                ".env file. Get a free API key at https://console.groq.com"
+                "Chatbot is not configured. Please set GEMINI_API_KEY in your "
+                ".env file. Get an API key at https://aistudio.google.com"
             ),
         )
 
@@ -401,13 +401,13 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     # ── 2. Build grounded system prompt ──────────────────────────────────────
     system_prompt = _build_system_prompt(payload.context, live_data)
 
-    # ── 3. Call Groq Cloud LLM ────────────────────────────────────────────────
+    # ── 3. Call Google Gemini LLM ─────────────────────────────────────────────
     client = AsyncOpenAI(
-        api_key=settings.GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
+        api_key=settings.GEMINI_API_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
     )
 
-    model = settings.GROQ_MODEL
+    model = settings.GEMINI_MODEL
 
     # Build messages list: system + prior history (last 6 turns) + current question
     history_msgs = [
@@ -429,17 +429,17 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     except AuthenticationError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid GROQ_API_KEY. Please verify your key at https://console.groq.com",
+            detail="Invalid GEMINI_API_KEY. Please verify your key at https://aistudio.google.com",
         )
     except RateLimitError:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Groq API rate limit reached. Please wait a moment and try again.",
+            detail="Gemini API rate limit reached. Please wait a moment and try again.",
         )
     except APIConnectionError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not connect to the Groq API. Please try again later.",
+            detail="Could not connect to the Gemini API. Please try again later.",
         )
     except Exception as exc:
         import logging as _logging

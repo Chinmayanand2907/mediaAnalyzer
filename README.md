@@ -9,7 +9,7 @@
 
 ## Overview
 
-**EngageIQ** is an end-to-end social media intelligence platform. It fetches raw data from YouTube and Reddit via their official APIs, stores it across a dual-database layer (MongoDB for raw payloads, PostgreSQL for structured metrics), runs HuggingFace RoBERTa sentiment analysis and XGBoost engagement forecasting in the background via Celery, and exposes everything through a FastAPI REST layer to a React dashboard — complete with a live AI analyst chatbot powered by Groq Cloud (LLaMA 3.3 70B).
+**EngageIQ** is an end-to-end social media intelligence platform. It fetches raw data from YouTube and Reddit via their official APIs, stores it across a dual-database layer (MongoDB for raw payloads, PostgreSQL for structured metrics), runs HuggingFace RoBERTa sentiment analysis and XGBoost engagement forecasting in the background via Celery, and exposes everything through a FastAPI REST layer to a React dashboard — complete with a live AI analyst chatbot powered by Google Gemini (gemini-2.5-flash-lite).
 
 ---
 
@@ -40,7 +40,7 @@
 - **Correlation summary** — single unified payload combining shared videos, engagement, sentiment, and topics.
 
 ### AI Analyst Chatbot
-- Powered by **Groq Cloud (LLaMA 3.3 70B / compound)** via the OpenAI-compatible API.
+- Powered by **Google Gemini (gemini-2.5-flash-lite)** via the OpenAI-compatible API.
 - Context is **dynamically injected at request time** — the backend fetches live metrics from MongoDB and PostgreSQL and embeds them into the system prompt before calling the LLM.
 - Three specialist personas depending on active dashboard view:
   - `youtube` → **Video Performance Consultant**
@@ -67,7 +67,7 @@
 | **ORM / Validation** | SQLModel, SQLAlchemy 2 (async), Pydantic v2 |
 | **Databases** | PostgreSQL 17 (structured metrics), MongoDB Atlas (raw payloads & comments) |
 | **ML / NLP** | HuggingFace Transformers (RoBERTa), NLTK VADER, XGBoost, Scikit-learn, Pandas, NumPy |
-| **LLM / Chatbot** | Groq Cloud (LLaMA 3.3 70B), OpenAI-compatible SDK |
+| **LLM / Chatbot** | Google Gemini (gemini-2.5-flash-lite), OpenAI-compatible SDK |
 | **External APIs** | YouTube Data API v3 (`google-api-python-client`), Reddit API (`PRAW 8`) |
 | **DevOps** | Docker, Docker Compose (5-service stack) |
 | **Testing** | Pytest, pytest-asyncio |
@@ -134,7 +134,7 @@ Open `.env` and fill in your credentials:
 | `MONGO_URI` | MongoDB Atlas → Connect → Drivers |
 | `YOUTUBE_API_KEY` | [Google Cloud Console](https://console.cloud.google.com/) → YouTube Data API v3 |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | [Reddit App Preferences](https://www.reddit.com/prefs/apps) → create a script app |
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) |
+| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com) |
 
 ---
 
@@ -203,7 +203,7 @@ mediaAnalyzer/
 │   │   ├── youtube.py            # /api/v1/youtube — sync, metrics, sentiment
 │   │   ├── reddit.py             # /api/v1/reddit  — sync, sentiment, keywords
 │   │   ├── cross_platform.py     # /api/v1/cross-platform — correlation & comparison
-│   │   └── chatbot.py            # /api/v1/chatbot — Groq LLM with live data context
+│   │   └── chatbot.py            # /api/v1/chatbot — Google Gemini LLM with live data context
 │   ├── core/
 │   │   ├── config.py             # Pydantic Settings (env vars, DSNs)
 │   │   └── celery_app.py         # Celery instance & queue definitions
@@ -284,8 +284,8 @@ Test coverage includes API router mocks, external API client mocking, PostgreSQL
 | `REDDIT_CLIENT_ID` | — | Reddit OAuth2 app client ID |
 | `REDDIT_CLIENT_SECRET` | — | Reddit OAuth2 app secret |
 | `REDDIT_USER_AGENT` | `EngageLens/3.0` | PRAW user-agent string |
-| `GROQ_API_KEY` | — | Groq Cloud API key |
-| `GROQ_MODEL` | `groq/compound` | Groq model identifier (e.g. `llama-3.3-70b-versatile`) |
+| `GEMINI_API_KEY` | — | Google Gemini API key |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model identifier (e.g. `gemini-2.5-flash-lite`) |
 
 ---
 
