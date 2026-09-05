@@ -4,6 +4,17 @@ Reddit API — async service wrapper (PRAW).
 PRAW is a synchronous library, so all blocking calls are dispatched
 to a background thread via ``asyncio.to_thread``.
 
+Changes vs original
+-------------------
+* Every PRAW network call is now preceded by ``await rate_limiter.acquire()``
+  to enforce Reddit's 60 req/min limit via a distributed Redis token bucket.
+* ``fetch_top_comments`` uses ``replace_more(limit=0)`` to avoid triggering
+  multiple hidden "MoreComments" HTTP requests that can blow through the rate
+  limit during deep-tree scraping.
+* A new ``fetch_top_comments_batched`` method accepts multiple post IDs and
+  processes them concurrently under a bounded ``asyncio.Semaphore`` to prevent
+  thundering-herd bursts while still being faster than sequential calls.
+
 Public interface
 ────────────────
     client = RedditClient()
@@ -11,6 +22,7 @@ Public interface
     threads = await client.fetch_hot_threads("python", limit=15)
     post    = await client.fetch_post_details("1abc2de")
     comments = await client.fetch_top_comments("1abc2de", limit=30)
+    batch   = await client.fetch_top_comments_batched(["id1", "id2", ...])
 
 All methods return **Pydantic v2 models** for type-safe downstream use.
 """
@@ -36,6 +48,7 @@ from prawcore.exceptions import (
 from pydantic import BaseModel, Field
 
 from app.core.config import get_settings
+from app.core.rate_limiter import get_reddit_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +137,9 @@ class RedditForbidden(RedditClientError):
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 2  # seconds
 
+# Semaphore for batched concurrent comment fetching (avoids burst storms)
+_BATCH_CONCURRENCY = 3
+
 
 class RedditClient:
     """Async wrapper around PRAW (Python Reddit API Wrapper).
@@ -161,16 +177,27 @@ class RedditClient:
             client_secret=self._client_secret,
             user_agent=self._user_agent,
         )
+        # Shared rate limiter (may be backed by Redis across workers)
+        self._rate_limiter = get_reddit_rate_limiter()
 
     # ── internal helpers ─────────────────────────────────────
 
     async def _run_in_thread(self, func, *args, **kwargs):
         """Execute a synchronous PRAW call in a background thread
-        with retry logic for transient failures.
+        with rate limiting and retry logic for transient failures.
         """
         last_error: Exception | None = None
 
         for attempt in range(1, _MAX_RETRIES + 1):
+            # Acquire a rate-limiter token before every network call
+            try:
+                await self._rate_limiter.acquire()
+            except asyncio.TimeoutError as exc:
+                raise RedditRateLimited(
+                    "Timed out waiting for rate-limiter token — "
+                    "Reddit API is being accessed too frequently."
+                ) from exc
+
             try:
                 return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -325,7 +352,8 @@ class RedditClient:
         def _fetch():
             submission = self._reddit.submission(id=post_id)
             submission.comment_sort = comment_sort
-            submission.comments.replace_more(limit=0)  # skip "load more"
+            # replace_more(limit=0) prevents MoreComments HTTP requests
+            submission.comments.replace_more(limit=0)
             return submission
 
         submission = await self._run_in_thread(_fetch)
@@ -348,6 +376,10 @@ class RedditClient:
         reply_depth: int = 1,
     ) -> TopCommentsResponse:
         """Fetch top-level comments for a post (optionally with replies).
+
+        Uses ``replace_more(limit=0)`` to avoid triggering additional
+        HTTP requests for "MoreComments" nodes, which prevents rate-limit
+        spikes during deep comment tree scraping.
 
         Parameters
         ----------
@@ -374,6 +406,7 @@ class RedditClient:
         def _fetch():
             submission = self._reddit.submission(id=post_id)
             submission.comment_sort = sort
+            # Prevent MoreComments HTTP storm — single API call only
             submission.comments.replace_more(limit=0)
             return submission
 
@@ -402,3 +435,49 @@ class RedditClient:
             count=len(comments),
             comments=comments,
         )
+
+    async def fetch_top_comments_batched(
+        self,
+        post_ids: list[str],
+        *,
+        limit: int = 30,
+        sort: str = "top",
+        concurrency: int = _BATCH_CONCURRENCY,
+    ) -> dict[str, TopCommentsResponse]:
+        """Fetch top comments for multiple posts concurrently.
+
+        Uses an ``asyncio.Semaphore`` to bound concurrent PRAW calls so
+        we do not burst beyond the rate limit capacity in the token bucket.
+
+        Parameters
+        ----------
+        post_ids : list[str]
+            Reddit post IDs to process.
+        limit : int
+            Max comments per post (default 30).
+        sort : str
+            Comment sort order (default ``"top"``).
+        concurrency : int
+            Maximum concurrent PRAW calls (default 3).
+
+        Returns
+        -------
+        dict[str, TopCommentsResponse]
+            Mapping of ``post_id → TopCommentsResponse``.
+        """
+        semaphore = asyncio.Semaphore(concurrency)
+        results: dict[str, TopCommentsResponse] = {}
+
+        async def _guarded_fetch(post_id: str) -> None:
+            async with semaphore:
+                try:
+                    results[post_id] = await self.fetch_top_comments(
+                        post_id, limit=limit, sort=sort
+                    )
+                except RedditClientError as exc:
+                    logger.warning(
+                        "Skipping comments for post %s: %s", post_id, exc
+                    )
+
+        await asyncio.gather(*[_guarded_fetch(pid) for pid in post_ids])
+        return results

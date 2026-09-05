@@ -99,6 +99,8 @@ class RedditDiscussionItem(BaseModel):
     permalink: Optional[str] = None
     sentiment_label: Optional[str] = "neutral"
     sentiment_score: Optional[float] = None
+    match_type: Optional[str] = "url"  # "url" | "semantic"
+    similarity_score: Optional[float] = None
 
 
 class PlatformSentimentBreakdown(BaseModel):
@@ -135,6 +137,8 @@ class SharedVideoItem(BaseModel):
     sentiment_disparity_note: Optional[str] = None
     reddit_discussions: List[RedditDiscussionItem] = Field(default_factory=list)
     topics: List[str] = Field(default_factory=list)
+    match_type: Optional[str] = "url"  # "url" | "semantic" | "hybrid"
+    similarity_score: Optional[float] = None
 
 
 class PlatformEngagementComparison(BaseModel):

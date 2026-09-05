@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import {
   ExternalLink, Eye, ThumbsUp, MessageSquare, Star,
-  Clock, ChevronDown, ChevronUp, Layers, User, Calendar, Tag,
+  Clock, ChevronDown, ChevronUp, Layers, User, Calendar, Tag, Sparkles,
 } from 'lucide-react';
 
 function fmt(n) {
@@ -211,6 +211,44 @@ export default function SharedVideosTable({ videos, loading, showTopBadge = fals
                               <Calendar size={11} /> {pubDate}
                             </span>
                           )}
+                          {v.match_type === 'semantic' && (
+                            <span
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 3,
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: '#c084fc',
+                                background: 'rgba(192, 132, 252, 0.12)',
+                                border: '1px solid rgba(192, 132, 252, 0.3)',
+                                padding: '1px 6px',
+                                borderRadius: 4,
+                              }}
+                              title={v.similarity_score ? `Semantic Similarity: ${Math.round(v.similarity_score * 100)}%` : 'Semantic Match'}
+                            >
+                              <Sparkles size={10} /> Semantic {v.similarity_score ? `${Math.round(v.similarity_score * 100)}%` : ''}
+                            </span>
+                          )}
+                          {v.match_type === 'hybrid' && (
+                            <span
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 3,
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color: '#38bdf8',
+                                background: 'rgba(56, 189, 248, 0.12)',
+                                border: '1px solid rgba(56, 189, 248, 0.3)',
+                                padding: '1px 6px',
+                                borderRadius: 4,
+                              }}
+                              title="Matched via both Direct URL and Semantic Content"
+                            >
+                              <Sparkles size={10} /> Hybrid
+                            </span>
+                          )}
                         </div>
 
                         {/* Topic Tags */}
@@ -363,12 +401,26 @@ export default function SharedVideosTable({ videos, loading, showTopBadge = fals
                                     <span style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', alignItems: 'center', gap: 4 }}>
                                       <User size={11} /> u/{d.author}
                                     </span>
-                                    {d.published_at && (
-                                      <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                                        • {formatDate(d.published_at)}
-                                      </span>
-                                    )}
-                                  </div>
+                                      {d.published_at && (
+                                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                                          • {formatDate(d.published_at)}
+                                        </span>
+                                      )}
+                                      {d.match_type === 'semantic' && (
+                                        <span
+                                          style={{
+                                            padding: '1px 6px', borderRadius: 4,
+                                            fontSize: 10, fontWeight: 700,
+                                            background: 'rgba(192, 132, 252, 0.15)',
+                                            color: '#c084fc',
+                                            display: 'inline-flex', alignItems: 'center', gap: 3,
+                                          }}
+                                          title={d.similarity_score ? `Similarity: ${Math.round(d.similarity_score * 100)}%` : 'Semantic Match'}
+                                        >
+                                          <Sparkles size={9} /> Semantic {d.similarity_score ? `${Math.round(d.similarity_score * 100)}%` : ''}
+                                        </span>
+                                      )}
+                                    </div>
 
                                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                                     {/* Sentiment badge */}

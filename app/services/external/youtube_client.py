@@ -4,6 +4,18 @@ YouTube Data API v3 — async service wrapper.
 Wraps the synchronous ``google-api-python-client`` with
 ``asyncio.to_thread`` so every call is non-blocking.
 
+Changes vs original
+-------------------
+* ``fetch_channel_videos`` now reads from the channel's **uploads playlist**
+  (``playlistItems.list`` — 1 quota unit) instead of ``search().list``
+  (100 quota units), reducing video-listing cost by 99 %.
+* All public methods are wrapped with **Redis caching** (TTL configurable via
+  ``Settings.YOUTUBE_CACHE_TTL``).  A cache-miss triggers the real API call
+  and the result is stored for subsequent requests.
+* Every API call goes through **``YouTubeQuotaManager.check_and_record``**
+  to proactively gate requests before the daily 10 000-unit budget is
+  exhausted.
+
 Public interface
 ────────────────
     client = YouTubeClient()
@@ -18,6 +30,7 @@ All methods return **Pydantic v2 models** for type-safe downstream use.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from datetime import datetime
 from typing import Optional
@@ -63,7 +76,7 @@ class VideoMetadata(BaseModel):
 
 
 class ChannelVideoItem(BaseModel):
-    """Lightweight reference to a video found via channel search."""
+    """Lightweight reference to a video found via channel uploads playlist."""
     video_id: str
     title: str
     description: str = ""
@@ -135,6 +148,12 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 2  # seconds
 
 
+def _cache_key(*parts: str) -> str:
+    """Build a short, stable cache key from an arbitrary set of string parts."""
+    raw = ":".join(parts)
+    return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 — not crypto
+
+
 class YouTubeClient:
     """Async wrapper around the YouTube Data API v3.
 
@@ -159,11 +178,24 @@ class YouTubeClient:
             developerKey=self._api_key,
             cache_discovery=False,
         )
+        self._cache_ttl: int = int(getattr(settings, "YOUTUBE_CACHE_TTL", 3600))
+
+    # ── cache helpers ─────────────────────────────────────────
+
+    def _cache(self):
+        """Return a RedisCache instance (lazy — avoids import at module load)."""
+        from app.core.cache import get_cache
+        return get_cache(prefix="yt:")
+
+    def _quota(self):
+        """Return the YouTubeQuotaManager singleton."""
+        from app.services.external.youtube_quota import YouTubeQuotaManager
+        return YouTubeQuotaManager()
 
     # ── internal helpers ─────────────────────────────────────
 
     async def _execute_with_retry(self, request) -> dict:
-        """Run a google-api request in a thread with retry + backoff.
+        """Run a google-api request in a thread with retry + exponential backoff.
 
         Retries on 500/503 (server errors) and 429 (rate-limit).
         Raises immediately on 403 quota errors and 404s.
@@ -200,9 +232,12 @@ class YouTubeClient:
 
                 # ── Retryable errors (429, 500, 503) ─────────
                 if status in (429, 500, 503):
-                    wait = _RETRY_BACKOFF_BASE ** attempt
+                    # Exponential backoff with jitter
+                    import random
+                    jitter = random.uniform(0, 1)
+                    wait = (_RETRY_BACKOFF_BASE ** attempt) + jitter
                     logger.warning(
-                        "YouTube API %s (attempt %d/%d) — retrying in %ds",
+                        "YouTube API %s (attempt %d/%d) — retrying in %.1fs",
                         status, attempt, _MAX_RETRIES, wait,
                     )
                     last_error = exc
@@ -256,6 +291,20 @@ class YouTubeClient:
         YouTubeAPIError
             On any other API failure.
         """
+        cache = self._cache()
+        key = f"video:{video_id}"
+        cached = await cache.get(key)
+        if cached is not None:
+            logger.debug("[YTClient] Cache HIT — video:%s", video_id)
+            return VideoMetadata(**cached)
+
+        # Quota gate: videos.list costs 1 unit
+        from app.services.external.youtube_quota import QuotaCost
+        try:
+            await self._quota().check_and_record(QuotaCost.DEFAULT)
+        except YouTubeQuotaExceeded:
+            raise
+
         request = self._service.videos().list(
             part="snippet,statistics,contentDetails",
             id=video_id,
@@ -279,7 +328,7 @@ class YouTubeClient:
             or thumbnails.get("default", {}).get("url")
         )
 
-        return VideoMetadata(
+        result = VideoMetadata(
             video_id=video_id,
             title=snippet.get("title", ""),
             description=snippet.get("description", ""),
@@ -298,6 +347,8 @@ class YouTubeClient:
             ),
             raw=item,
         )
+        await cache.set(key, result.model_dump(), ttl=self._cache_ttl)
+        return result
 
     async def fetch_channel_videos(
         self,
@@ -309,6 +360,11 @@ class YouTubeClient:
     ) -> ChannelVideosResponse:
         """List recent uploads from a channel.
 
+        Uses the channel's **uploads playlist** (``playlistItems.list``,
+        cost = **1 unit**) instead of ``search().list`` (cost = **100 units**).
+        Falls back to ``search().list`` only if the uploads playlist ID cannot
+        be determined and quota permits.
+
         Parameters
         ----------
         channel_id : str
@@ -318,14 +374,82 @@ class YouTubeClient:
         page_token : str | None
             Pagination token from a previous response.
         order : str
-            Sort order — ``"date"`` (default), ``"viewCount"``, or ``"relevance"``.
+            Not applicable when using the uploads playlist (results are
+            always returned newest-first); kept for API compatibility.
 
         Returns
         -------
         ChannelVideosResponse
             List of video stubs with a ``next_page_token`` for pagination.
         """
-        kwargs: dict = dict(
+        cache = self._cache()
+        key = f"channel_videos:{channel_id}:{max_results}:{page_token or ''}"
+        cached = await cache.get(key)
+        if cached is not None:
+            logger.debug("[YTClient] Cache HIT — channel_videos:%s", channel_id)
+            return ChannelVideosResponse(**cached)
+
+        from app.services.external.youtube_quota import QuotaCost
+
+        # ── Strategy 1: uploads playlist (1 unit) ─────────────────────────
+        # The uploads playlist ID is always "UU" + channel_id[2:]
+        uploads_playlist_id = "UU" + channel_id[2:]
+        try:
+            await self._quota().check_and_record(QuotaCost.DEFAULT)
+            kwargs: dict = dict(
+                part="snippet",
+                playlistId=uploads_playlist_id,
+                maxResults=min(max_results, 50),
+            )
+            if page_token:
+                kwargs["pageToken"] = page_token
+            request = self._service.playlistItems().list(**kwargs)
+            data = await self._execute_with_retry(request)
+
+            videos: list[ChannelVideoItem] = []
+            for item in data.get("items", []):
+                snippet = item.get("snippet", {})
+                vid = snippet.get("resourceId", {}).get("videoId", "")
+                thumbnails = snippet.get("thumbnails", {})
+                thumb_url = (
+                    thumbnails.get("high", {}).get("url")
+                    or thumbnails.get("default", {}).get("url")
+                )
+                if vid:
+                    videos.append(ChannelVideoItem(
+                        video_id=vid,
+                        title=snippet.get("title", ""),
+                        description=snippet.get("description", ""),
+                        published_at=snippet.get("publishedAt"),
+                        thumbnail_url=thumb_url,
+                    ))
+
+            result = ChannelVideosResponse(
+                channel_id=channel_id,
+                total_results=len(videos),
+                next_page_token=data.get("nextPageToken"),
+                videos=videos,
+            )
+            await cache.set(key, result.model_dump(), ttl=self._cache_ttl)
+            return result
+
+        except YouTubeQuotaExceeded:
+            raise
+        except Exception as playlist_exc:
+            logger.warning(
+                "[YTClient] Uploads playlist failed for %s (%s). "
+                "Falling back to search.list (100 units).",
+                channel_id, playlist_exc,
+            )
+
+        # ── Strategy 2 (fallback): search.list (100 units) ───────────────
+        # Check and record 100 units before proceeding.
+        await self._quota().check_and_record(QuotaCost.SEARCH_LIST)
+        logger.warning(
+            "[YTClient] Using search.list for channel %s — costs 100 quota units.",
+            channel_id,
+        )
+        kwargs_search: dict = dict(
             part="snippet",
             channelId=channel_id,
             type="video",
@@ -333,11 +457,11 @@ class YouTubeClient:
             maxResults=min(max_results, 50),
         )
         if page_token:
-            kwargs["pageToken"] = page_token
-        request = self._service.search().list(**kwargs)
+            kwargs_search["pageToken"] = page_token
+        request = self._service.search().list(**kwargs_search)
         data = await self._execute_with_retry(request)
 
-        videos: list[ChannelVideoItem] = []
+        videos = []
         for item in data.get("items", []):
             snippet = item.get("snippet", {})
             vid = item.get("id", {}).get("videoId", "")
@@ -355,12 +479,14 @@ class YouTubeClient:
             ))
 
         page_info = data.get("pageInfo", {})
-        return ChannelVideosResponse(
+        result = ChannelVideosResponse(
             channel_id=channel_id,
             total_results=self._safe_int(page_info.get("totalResults")),
             next_page_token=data.get("nextPageToken"),
             videos=videos,
         )
+        await cache.set(key, result.model_dump(), ttl=self._cache_ttl)
+        return result
 
     async def fetch_comment_threads(
         self,
@@ -388,6 +514,16 @@ class YouTubeClient:
         CommentThreadsResponse
             Threads with nested replies and a ``next_page_token``.
         """
+        cache = self._cache()
+        key = f"comments:{video_id}:{max_results}:{page_token or ''}"
+        cached = await cache.get(key)
+        if cached is not None:
+            logger.debug("[YTClient] Cache HIT — comments:%s", video_id)
+            return CommentThreadsResponse(**cached)
+
+        from app.services.external.youtube_quota import QuotaCost
+        await self._quota().check_and_record(QuotaCost.DEFAULT)
+
         kwargs: dict = dict(
             part="snippet,replies",
             videoId=video_id,
@@ -441,8 +577,10 @@ class YouTubeClient:
                 replies=replies,
             ))
 
-        return CommentThreadsResponse(
+        result = CommentThreadsResponse(
             video_id=video_id,
             next_page_token=data.get("nextPageToken"),
             threads=threads,
         )
+        await cache.set(key, result.model_dump(), ttl=self._cache_ttl)
+        return result

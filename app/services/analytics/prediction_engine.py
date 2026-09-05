@@ -55,6 +55,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from app.services.analytics.category_benchmarks import (
+    CATEGORY_BENCHMARKS,
+    CategoryBenchmark,
+    detect_category,
+    generate_category_forecast,
+    generate_warmup_records,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── Optional XGBoost import ───────────────────────────────────────────────────
@@ -105,9 +113,11 @@ class ForecastResult:
     predicted_comments: float
     confidence_interval: Tuple[float, float]   # (lower, upper) for views
     engine: str = "unknown"
+    category: Optional[str] = None
+    prior_weight: Optional[float] = None
 
     def to_dict(self) -> Dict:
-        return {
+        res = {
             "forecast_step":       self.forecast_step,
             "predicted_views":     round(max(0.0, self.predicted_views), 1),
             "predicted_likes":     round(max(0.0, self.predicted_likes), 1),
@@ -118,6 +128,11 @@ class ForecastResult:
             ],
             "engine": self.engine,
         }
+        if self.category is not None:
+            res["category"] = self.category
+        if self.prior_weight is not None:
+            res["prior_weight"] = round(self.prior_weight, 2)
+        return res
 
 
 # ── Preprocessing pipeline ────────────────────────────────────────────────────
@@ -237,7 +252,11 @@ class FeaturePipeline:
             for col in target_cols:
                 lagged[f"{col}_lag{lag}"] = lagged[col].shift(lag)
 
-        lagged = lagged.dropna().reset_index(drop=True)
+        if len(lagged) > self.lag_steps:
+            lagged = lagged.dropna().reset_index(drop=True)
+        else:
+            # For short histories, backfill and zero-fill to avoid returning an empty DataFrame
+            lagged = lagged.bfill().fillna(0.0).reset_index(drop=True)
         return lagged
 
     @staticmethod
@@ -429,34 +448,129 @@ class PredictionEngine:
         self,
         recent_history: List[Dict[str, Any]],
         num_posts: int = 5,
+        category: Optional[str] = None,
     ) -> List[Dict]:
         """
         Forecast engagement metrics for the next *num_posts* posts.
 
-        The forecast is *iterative*: after each step the predicted values are
-        fed back as inputs for the subsequent step.
+        Supports cold-start (0 historical records) and few-data-point regimes (< 5 posts)
+        via Global Category Benchmarks and Transfer Learning with empirical Bayes shrinkage.
 
         Parameters
         ----------
         recent_history:
             Ordered list of historical post records (oldest → newest).
-            Minimum length: lag_steps + 1.
         num_posts:
             How many future posts to forecast (default: 5).
+        category:
+            Optional content category (e.g. "tech", "gaming", "entertainment").
+            If None, auto-detected from history/metadata.
 
         Returns
         -------
         List[dict] — one ForecastResult.to_dict() per forecast step.
         """
-        if not recent_history:
-            logger.warning("forecast_next_posts called with empty history.")
-            return []
+        cat = detect_category(
+            history_records=recent_history,
+            explicit_category=category,
+        )
 
+        n_history = len(recent_history) if recent_history else 0
+
+        # ── Regime 1: Cold Start (N = 0) ──────────────────────────────────────
+        if n_history == 0:
+            logger.info(
+                "Cold start for category '%s' (0 history records). Using Global Category Benchmark.",
+                cat,
+            )
+            return generate_category_forecast(cat, num_posts=num_posts)
+
+        # ── Regime 2: Transfer Learning for Few Data Points (1 <= N < 5) ──────
+        min_required = self.pipeline.lag_steps + 1
+        if n_history < min_required:
+            logger.info(
+                "Few historical records (%d < %d) for category '%s'. "
+                "Applying Warmup Synthesis & Transfer Learning (Empirical Bayes).",
+                n_history, min_required, cat,
+            )
+            # Compute observed channel scale
+            views_list = [
+                float((r.get("engagement_metrics") or {}).get("views", 0))
+                for r in recent_history
+            ]
+            observed_views = float(np.mean(views_list)) if views_list else None
+            observed_ratios = self._engagement_ratios(recent_history)
+
+            # Synthesize preceding warmup records to seed lag features
+            warmup_needed = min_required - n_history
+            warmup_records = generate_warmup_records(
+                cat,
+                needed_count=warmup_needed,
+                base_record=recent_history[0],
+                observed_views=observed_views,
+            )
+            augmented_history = warmup_records + list(recent_history)
+
+            # Fit pipeline on augmented history
+            try:
+                feature_df = self.pipeline.fit_transform(augmented_history)
+            except Exception as exc:
+                logger.error("Warmup feature pipeline failed: %s", exc)
+                feature_df = pd.DataFrame()
+
+            # Channel-specific forecast
+            if not feature_df.empty and self._model and _XGBOOST_AVAILABLE:
+                channel_forecasts = self._xgboost_forecast(feature_df, augmented_history, num_posts)
+            else:
+                channel_forecasts = self._baseline_forecast(recent_history, num_posts)
+
+            # Category benchmark forecast scaled to channel
+            category_forecasts = generate_category_forecast(
+                cat,
+                num_posts=num_posts,
+                scale_views=observed_views,
+                scale_ratios=observed_ratios,
+            )
+
+            # Empirical Bayes shrinkage: channel weight w = N / 5
+            channel_weight = min(1.0, max(0.0, float(n_history) / 5.0))
+            prior_weight = 1.0 - channel_weight
+
+            blended: List[Dict[str, Any]] = []
+            for step in range(1, num_posts + 1):
+                c_step = channel_forecasts[step - 1] if step <= len(channel_forecasts) else {}
+                p_step = category_forecasts[step - 1] if step <= len(category_forecasts) else {}
+
+                pv = channel_weight * c_step.get("predicted_views", 0.0) + prior_weight * p_step.get("predicted_views", 0.0)
+                pl = channel_weight * c_step.get("predicted_likes", 0.0) + prior_weight * p_step.get("predicted_likes", 0.0)
+                pc = channel_weight * c_step.get("predicted_comments", 0.0) + prior_weight * p_step.get("predicted_comments", 0.0)
+
+                c_ci = c_step.get("confidence_interval", [pv * 0.8, pv * 1.2])
+                p_ci = p_step.get("confidence_interval", [pv * 0.8, pv * 1.2])
+                ci_low = channel_weight * c_ci[0] + prior_weight * p_ci[0]
+                ci_high = channel_weight * c_ci[1] + prior_weight * p_ci[1]
+
+                res = ForecastResult(
+                    forecast_step=step,
+                    predicted_views=pv,
+                    predicted_likes=pl,
+                    predicted_comments=pc,
+                    confidence_interval=(ci_low, ci_high),
+                    engine="transfer_learning",
+                    category=cat,
+                    prior_weight=prior_weight,
+                )
+                blended.append(res.to_dict())
+
+            return blended
+
+        # ── Regime 3: Sufficient History (N >= 5) ──────────────────────────────
         logger.info(
-            "Forecasting %d posts using %s engine (%d history records).",
+            "Forecasting %d posts using %s engine (%d history records, category '%s').",
             num_posts,
             "xgboost" if (self._model and _XGBOOST_AVAILABLE) else "baseline",
-            len(recent_history),
+            n_history,
+            cat,
         )
 
         try:
@@ -467,12 +581,18 @@ class PredictionEngine:
 
         if feature_df.empty:
             logger.warning("Feature pipeline returned an empty DataFrame.")
-            return []
+            return self._baseline_forecast(recent_history, num_posts)
 
         if self._model and _XGBOOST_AVAILABLE:
-            return self._xgboost_forecast(feature_df, recent_history, num_posts)
+            forecasts = self._xgboost_forecast(feature_df, recent_history, num_posts)
         else:
-            return self._baseline_forecast(recent_history, num_posts)
+            forecasts = self._baseline_forecast(recent_history, num_posts)
+
+        for f in forecasts:
+            f["category"] = cat
+            f["prior_weight"] = 0.0
+
+        return forecasts
 
     # ── Internal forecast strategies ──────────────────────────────────────
 
@@ -619,3 +739,14 @@ class PredictionEngine:
             "sentiment": {"positive": 0.5, "neutral": 0.4, "negative": 0.1},
             "topic_encoded": 0,
         }
+
+    def get_category_benchmark(self, category: str) -> Dict[str, Any]:
+        """Return empirical benchmark parameters for a given category."""
+        canon = detect_category(explicit_category=category)
+        bench = CATEGORY_BENCHMARKS.get(canon, CATEGORY_BENCHMARKS["general"])
+        return bench.to_dict()
+
+    @staticmethod
+    def list_supported_categories() -> List[str]:
+        """List all supported content categories."""
+        return list(CATEGORY_BENCHMARKS.keys())

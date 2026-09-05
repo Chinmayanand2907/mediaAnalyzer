@@ -16,6 +16,10 @@ import CommentsTable from '../components/tables/CommentsTable';
 
 const ACCENT = 'var(--yt-primary)';
 
+// YouTube Channel IDs always start with "UC" and are exactly 24 characters.
+// Enforcing this on the frontend prevents the 100-unit search.list fallback.
+const YT_CHANNEL_ID_REGEX = /^UC[a-zA-Z0-9_-]{22}$/;
+
 function fmt(n) {
   if (n == null) return '—';
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -26,6 +30,7 @@ function fmt(n) {
 export default function YoutubeView() {
   const [selectedChannel, setSelectedChannel] = useState(null);
   const [newChannelInput, setNewChannelInput] = useState('');
+  const [channelIdError, setChannelIdError]   = useState('');
   const [inputMode, setInputMode] = useState(false); // toggle between dropdown and text input
   const [page, setPage]                       = useState(1);
   const [sentFilter, setSentFilter]           = useState(null);
@@ -71,6 +76,16 @@ export default function YoutubeView() {
     if (!rawTarget) return;
     const cleanTarget = rawTarget.trim();
     if (!cleanTarget) return;
+
+    // Block submission if the Channel ID format is invalid
+    if (!YT_CHANNEL_ID_REGEX.test(cleanTarget)) {
+      setChannelIdError(
+        `"${cleanTarget}" is not a valid Channel ID. ` +
+        'It must start with "UC" and be exactly 24 characters (e.g. UCBcRF18a7Qf58cCRy5xuWwQ).'
+      );
+      return;
+    }
+    setChannelIdError('');
 
     setIngestLoading(true);
     setIngestMsg(`⏳ Ingesting data for channel ${cleanTarget}...`);
@@ -168,47 +183,74 @@ export default function YoutubeView() {
                 </button>
               </div>
             ) : (
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <input
-                  type="text"
-                  autoFocus
-                  placeholder="Enter YouTube Channel ID (e.g. UCxxxxxx)"
-                  value={newChannelInput}
-                  onChange={(e) => setNewChannelInput(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && newChannelInput.trim()) handleIngest(newChannelInput.trim()); if (e.key === 'Escape') setInputMode(false); }}
-                  style={{
-                    minWidth: 280, padding: '8px 12px', borderRadius: 10,
-                    background: 'rgba(255,255,255,0.06)',
-                    border: '1px solid rgba(99,102,241,0.45)',
-                    color: 'var(--text-primary)', fontSize: 13,
-                    outline: 'none',
-                  }}
-                />
-                <button
-                  onClick={() => { if (newChannelInput.trim()) handleIngest(newChannelInput.trim()); }}
-                  disabled={!newChannelInput.trim() || ingestLoading}
-                  style={{
-                    display: 'flex', alignItems: 'center', gap: 5,
-                    padding: '8px 14px', borderRadius: 10,
-                    background: newChannelInput.trim() ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.04)',
-                    border: `1px solid ${newChannelInput.trim() ? 'rgba(99,102,241,0.5)' : 'var(--border)'}`,
-                    color: newChannelInput.trim() ? 'var(--yt-primary)' : 'var(--text-muted)',
-                    fontSize: 13, fontWeight: 600, cursor: 'pointer',
-                    transition: 'all 0.2s',
-                  }}
-                >
-                  <PlusCircle size={13} /> Ingest
-                </button>
-                <button
-                  onClick={() => { setInputMode(false); setNewChannelInput(''); }}
-                  style={{
-                    padding: '7px 10px', borderRadius: 10,
-                    background: 'transparent', border: '1px solid var(--border)',
-                    color: 'var(--text-muted)', fontSize: 12, cursor: 'pointer',
-                  }}
-                >✕</button>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <input
+                    id="yt-channel-id-input"
+                    type="text"
+                    autoFocus
+                    placeholder="UCxxxxxxxxxxxxxxxxxxxxxxxxx (24 chars)"
+                    value={newChannelInput}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setNewChannelInput(val);
+                      if (val && !YT_CHANNEL_ID_REGEX.test(val.trim())) {
+                        setChannelIdError('Must start with "UC" and be exactly 24 characters.');
+                      } else {
+                        setChannelIdError('');
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && newChannelInput.trim()) handleIngest(newChannelInput.trim());
+                      if (e.key === 'Escape') { setInputMode(false); setNewChannelInput(''); setChannelIdError(''); }
+                    }}
+                    style={{
+                      minWidth: 300, padding: '8px 12px', borderRadius: 10,
+                      background: 'rgba(255,255,255,0.06)',
+                      border: `1px solid ${channelIdError ? 'rgba(239,68,68,0.65)' : 'rgba(99,102,241,0.45)'}`,
+                      color: 'var(--text-primary)', fontSize: 13,
+                      outline: 'none',
+                      transition: 'border-color 0.2s',
+                    }}
+                  />
+                  <button
+                    onClick={() => { if (newChannelInput.trim()) handleIngest(newChannelInput.trim()); }}
+                    disabled={!newChannelInput.trim() || !!channelIdError || ingestLoading}
+                    title={channelIdError || 'Ingest this channel'}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      padding: '8px 14px', borderRadius: 10,
+                      background: (newChannelInput.trim() && !channelIdError) ? 'rgba(99,102,241,0.2)' : 'rgba(255,255,255,0.04)',
+                      border: `1px solid ${(newChannelInput.trim() && !channelIdError) ? 'rgba(99,102,241,0.5)' : 'var(--border)'}`,
+                      color: (newChannelInput.trim() && !channelIdError) ? 'var(--yt-primary)' : 'var(--text-muted)',
+                      fontSize: 13, fontWeight: 600, cursor: (newChannelInput.trim() && !channelIdError) ? 'pointer' : 'not-allowed',
+                      transition: 'all 0.2s',
+                    }}
+                  >
+                    <PlusCircle size={13} /> Ingest
+                  </button>
+                  <button
+                    onClick={() => { setInputMode(false); setNewChannelInput(''); setChannelIdError(''); }}
+                    style={{
+                      padding: '7px 10px', borderRadius: 10,
+                      background: 'transparent', border: '1px solid var(--border)',
+                      color: 'var(--text-muted)', fontSize: 12, cursor: 'pointer',
+                    }}
+                  >✕</button>
+                </div>
+                {channelIdError ? (
+                  <p style={{ fontSize: 11, color: 'rgba(239,68,68,0.9)', margin: 0, paddingLeft: 2 }}>
+                    ⚠ {channelIdError}
+                  </p>
+                ) : (
+                  <p style={{ fontSize: 11, color: 'var(--text-muted)', margin: 0, paddingLeft: 2 }}>
+                    Paste a YouTube Channel ID starting with <strong style={{ color: 'var(--text-primary)' }}>UC</strong> (24 chars).
+                    Find it in the channel URL: youtube.com/channel/<strong style={{ color: 'var(--yt-primary)' }}>UCxxxxxxxx…</strong>
+                  </p>
+                )}
               </div>
             )}
+
           </div>
 
           {/* Ingest button — only show when a channel is selected from dropdown */}

@@ -322,7 +322,27 @@ async def trigger_youtube_ingest(channel_id: str) -> TaskEnqueuedResponse:
 
     Returns immediately with a task ID — the client can poll Celery's result
     backend for completion status.
+
+    Channel ID requirements
+    -----------------------
+    Must be a canonical YouTube Channel ID matching ``^UC[a-zA-Z0-9_-]{22}$``.
+    Passing channel names, handles (@name), or usernames is **not supported**
+    because the search.list fallback costs 100 quota units per call.
     """
+    # ── Strict Channel ID validation ────────────────────────────────────────
+    _YT_CHANNEL_ID_RE = re.compile(r"^UC[a-zA-Z0-9_-]{22}$")
+    if not _YT_CHANNEL_ID_RE.match(channel_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"'{channel_id}' is not a valid YouTube Channel ID. "
+                "A Channel ID must start with 'UC' and be exactly 24 characters long "
+                "(e.g. 'UCBcRF18a7Qf58cCRy5xuWwQ'). "
+                "Passing channel names or @handles is not supported — "
+                "use the channel ID to avoid expensive search.list API calls."
+            ),
+        )
+
     try:
         task = celery_app.send_task(
             "app.tasks.ingestion_tasks.tasks_ingest_youtube_data",
@@ -339,3 +359,4 @@ async def trigger_youtube_ingest(channel_id: str) -> TaskEnqueuedResponse:
         message=f"Ingestion task queued for YouTube channel '{channel_id}'. "
                 "Data will be available within a few seconds.",
     )
+

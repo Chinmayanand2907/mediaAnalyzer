@@ -77,11 +77,30 @@ class Settings(BaseSettings):
         default="",
         description="Google Cloud API key with YouTube Data API v3 enabled",
     )
+    YOUTUBE_CACHE_TTL: int = Field(
+        default=3600,
+        description="TTL in seconds for cached YouTube API responses (1 hour).",
+    )
+    YOUTUBE_DAILY_QUOTA_LIMIT: int = Field(
+        default=10_000,
+        description="YouTube Data API v3 daily quota limit in units.",
+    )
+    YOUTUBE_QUOTA_SAFETY_BUFFER: int = Field(
+        default=500,
+        description=(
+            "Units reserved as a safety buffer. Proactive gating kicks in when "
+            "consumed >= YOUTUBE_DAILY_QUOTA_LIMIT - YOUTUBE_QUOTA_SAFETY_BUFFER."
+        ),
+    )
 
     # ── Reddit API (PRAW) ────────────────────────────────────────────────────
     REDDIT_CLIENT_ID: str = Field(default="", description="Reddit OAuth2 client ID")
     REDDIT_CLIENT_SECRET: str = Field(default="", description="Reddit OAuth2 secret")
     REDDIT_USER_AGENT: str = "EngagementAnalyzer/1.0"
+    REDDIT_RATE_LIMIT_CALLS_PER_MIN: int = Field(
+        default=60,
+        description="Reddit API max requests per minute (token-bucket capacity).",
+    )
 
     # ── Gemini LLM ───────────────────────────────────────────────────────────
     GEMINI_API_KEY: str = Field(
@@ -94,6 +113,16 @@ class Settings(BaseSettings):
             "Gemini model name used by the chatbot endpoint. "
             "Override in .env — e.g. GEMINI_MODEL=gemini-2.5-flash-lite"
         ),
+    )
+
+    # ── Semantic Matching (Sentence-BERT) ────────────────────────────────────
+    SEMANTIC_SIMILARITY_THRESHOLD: float = Field(
+        default=0.55,
+        description="Cosine similarity threshold (0.0-1.0) for semantic cross-platform matching.",
+    )
+    SEMANTIC_EMBEDDING_MODEL: str = Field(
+        default="all-MiniLM-L6-v2",
+        description="SentenceTransformer model name used for semantic cross-platform linking.",
     )
 
 

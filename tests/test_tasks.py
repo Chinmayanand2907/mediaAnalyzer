@@ -15,12 +15,14 @@ def mock_db(mocker):
     
     mock_session = mocker.MagicMock()
     mock_session_instance = AsyncMock()
+    mock_session_instance.add = mocker.MagicMock()
     mock_execute_result = mocker.MagicMock()
     mock_execute_result.scalar_one_or_none.return_value = None
     mock_session_instance.execute.return_value = mock_execute_result
     mock_session.return_value.__aenter__.return_value = mock_session_instance
     
     mocker.patch("app.tasks.ingestion_tasks.AsyncSessionLocal", mock_session)
+    mocker.patch("app.core.celery_app.celery_app.send_task")
     return mock_session_instance
 
 @pytest.mark.asyncio
@@ -53,6 +55,7 @@ async def test_ingest_reddit_data_async(mock_db, mocker):
     mock_reddit = mocker.patch("app.services.external.reddit_client.RedditClient")
     instance = mock_reddit.return_value
     instance.fetch_hot_threads = AsyncMock(return_value=mocker.MagicMock(threads=[]))
+    instance.fetch_top_comments_batched = AsyncMock(return_value={})
 
     mocker.patch("app.tasks.ingestion_tasks.asyncio.to_thread", side_effect=[
         {"display_name": "Test Subreddit", "title": "Test Subreddit", "description": "desc", "subscriber_count": 100, "over18": False},

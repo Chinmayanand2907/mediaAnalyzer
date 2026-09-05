@@ -11,7 +11,6 @@ Phase 1 — Intelligence Engine additions:
 """
 
 import asyncio
-import json
 import uuid
 from datetime import datetime, timezone
 
@@ -59,8 +58,15 @@ def _make_motor_client() -> AsyncIOMotorClient:
 # ─── Async Helpers ──────────────────────────────────────────────────────────
 
 async def _ingest_youtube_data_async(channel_id: str) -> None:
-    """Async implementation of YouTube data ingestion using the real YouTube Data API v3."""
+    """Async implementation of YouTube data ingestion using the real YouTube Data API v3.
+
+    Quota-aware: every API call is tracked via YouTubeQuotaManager.
+    Only canonical Channel IDs (``UC...``) are accepted — the ingestion
+    endpoint already enforces this with a regex, so there is no search.list
+    fallback here (which costs 100 units per call).
+    """
     from app.services.external.youtube_client import YouTubeClient, YouTubeAPIError
+    from app.services.external.youtube_quota import YouTubeQuotaManager, QuotaCost
 
     client = _make_motor_client()
     try:
@@ -72,82 +78,27 @@ async def _ingest_youtube_data_async(channel_id: str) -> None:
         logger.info(f"Fetching real YouTube data for channel input '{clean_input}'")
         yt = YouTubeClient()
 
-        # ── 1. Fetch channel metadata with multi-strategy resolution ──────
+        # ── 1. Fetch channel metadata — direct Channel ID lookup (1 unit) ──
+        # NOTE: search.list (100 units) is intentionally NOT used here.
+        # The API endpoint already validates that channel_id matches
+        # ^UC[a-zA-Z0-9_-]{22}$, so a direct channels.list lookup always works.
+        quota_mgr = YouTubeQuotaManager()
+        await quota_mgr.check_and_record(QuotaCost.DEFAULT)  # channels.list = 1 unit
+
         def _fetch_channel_info():
-            # Strategy A: Direct Channel ID lookup
             req = yt._service.channels().list(
                 part="snippet,statistics,brandingSettings",
                 id=clean_input,
             )
             res = req.execute()
-            items = res.get("items", [])
-            if items:
-                return items[0]
-
-            # Strategy B: Handle lookup (e.g. @mkbhd)
-            handle = clean_input if clean_input.startswith("@") else f"@{clean_input}"
-            try:
-                req = yt._service.channels().list(
-                    part="snippet,statistics,brandingSettings",
-                    forHandle=handle,
-                )
-                res = req.execute()
-                items = res.get("items", [])
-                if items:
-                    return items[0]
-            except Exception as e:
-                logger.debug(f"Handle lookup failed: {e}")
-
-            # Strategy C: Username lookup
-            try:
-                req = yt._service.channels().list(
-                    part="snippet,statistics,brandingSettings",
-                    forUsername=clean_input,
-                )
-                res = req.execute()
-                items = res.get("items", [])
-                if items:
-                    return items[0]
-            except Exception as e:
-                logger.debug(f"Username lookup failed: {e}")
-
-            # Strategy D: Search channel by query (costs 100 quota units — last resort)
-            try:
-                logger.warning(
-                    "Falling back to search.list for '%s' — costs 100 quota units. "
-                    "Pass the channel ID directly to avoid this.",
-                    clean_input,
-                )
-                s_req = yt._service.search().list(
-                    part="snippet",
-                    q=clean_input,
-                    type="channel",
-                    maxResults=1,
-                )
-                s_res = s_req.execute()
-                s_items = s_res.get("items", [])
-                if s_items:
-                    found_id = (
-                        s_items[0].get("snippet", {}).get("channelId")
-                        or s_items[0].get("id", {}).get("channelId")
-                    )
-                    if found_id:
-                        req = yt._service.channels().list(
-                            part="snippet,statistics,brandingSettings",
-                            id=found_id,
-                        )
-                        res = req.execute()
-                        items = res.get("items", [])
-                        if items:
-                            return items[0]
-            except Exception as e:
-                logger.debug(f"Search lookup failed: {e}")
-
-            return None
+            return res.get("items", [None])[0]
 
         ch = await asyncio.to_thread(_fetch_channel_info)
         if not ch:
-            raise ValueError(f"YouTube channel '{clean_input}' not found via API.")
+            raise ValueError(
+                f"YouTube channel '{clean_input}' not found via the YouTube API. "
+                "Ensure the Channel ID starts with 'UC' and is exactly 24 characters long."
+            )
 
         canonical_channel_id = ch.get("id", clean_input)
         snippet = ch.get("snippet", {})
@@ -306,40 +257,45 @@ async def _ingest_reddit_data_async(subreddit_name: str) -> None:
             logger.warning(f"Could not fetch threads for r/{clean_sub}: {e}")
             threads = []
 
-        # ── 3. Fetch comments from each hot thread ────────────────────────
+        # ── 3. Fetch comments from hot threads — async batched, rate-limited ─
         logger.info(f"Fetching comments from {len(threads)} hot threads in r/{clean_sub}")
 
-        for thread in threads[:5]:  # limit to 5 posts
-            try:
-                comments_resp = await reddit.fetch_top_comments(
-                    thread.post_id, limit=30, include_replies=False
-                )
-                for comment in comments_resp.comments:
-                    if not comment.body or comment.body in ("[deleted]", "[removed]"):
-                        continue
-                    comment_doc = {
-                        "platform":     "reddit",
-                        "platform_id":  comment.comment_id,
-                        "parent_id":    clean_sub,
-                        "post_id":      thread.post_id,
-                        "author":       comment.author,
-                        "body":         comment.body,
-                        "score":        comment.score,
-                        "published_at": datetime.fromtimestamp(
-                            comment.created_utc, tz=timezone.utc
-                        ).isoformat() if comment.created_utc else None,
-                        "permalink":    comment.permalink,
-                        "raw":          {},
-                        "ingested_at":  datetime.now(timezone.utc),
-                    }
-                    await comments_coll.update_one(
-                        {"platform": "reddit", "platform_id": comment.comment_id},
-                        {"$set": comment_doc},
-                        upsert=True,
-                    )
-            except RedditClientError as e:
-                logger.warning(f"Skipping comments for post {thread.post_id}: {e}")
-                continue
+        post_ids = [t.post_id for t in threads[:5]]  # limit to 5 posts
+        batch_results = await reddit.fetch_top_comments_batched(
+            post_ids, limit=30, concurrency=3
+        )
+
+        # Collect all comment docs for a single bulk_write
+        bulk_ops = []
+        now_utc = datetime.now(timezone.utc)
+        for post_id, comments_resp in batch_results.items():
+            for comment in comments_resp.comments:
+                if not comment.body or comment.body in ("[deleted]", "[removed]"):
+                    continue
+                comment_doc = {
+                    "platform":     "reddit",
+                    "platform_id":  comment.comment_id,
+                    "parent_id":    clean_sub,
+                    "post_id":      post_id,
+                    "author":       comment.author,
+                    "body":         comment.body,
+                    "score":        comment.score,
+                    "published_at": datetime.fromtimestamp(
+                        comment.created_utc, tz=timezone.utc
+                    ).isoformat() if comment.created_utc else None,
+                    "permalink":    comment.permalink,
+                    "raw":          {},
+                    "ingested_at":  now_utc,
+                }
+                bulk_ops.append(UpdateOne(
+                    {"platform": "reddit", "platform_id": comment.comment_id},
+                    {"$set": comment_doc},
+                    upsert=True,
+                ))
+
+        if bulk_ops:
+            await comments_coll.bulk_write(bulk_ops, ordered=False)
+            logger.info(f"Bulk-wrote {len(bulk_ops)} Reddit comments for r/{clean_sub}")
 
         # ── 4. Store subreddit payload in MongoDB ─────────────────────────
         logger.info(f"Storing Reddit payload in MongoDB for r/{clean_sub}")
@@ -349,7 +305,7 @@ async def _ingest_reddit_data_async(subreddit_name: str) -> None:
             "title":       display_name,
             "stats":       {"members": subscriber_count},
             "raw":         {"description": description},
-            "ingested_at": datetime.now(timezone.utc),
+            "ingested_at": now_utc,
         }
         await payloads_coll.update_one(
             {"platform": "reddit", "platform_id": clean_sub},
@@ -512,7 +468,6 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
         all_doc_ids: list = []
         all_categories: list[str] = []
         batch_docs: list = []
-        batch_bulk_ops: list = []
 
         async def _flush_batch(batch: list) -> None:
             """Run inference on a batch and bulk-write results."""
@@ -574,27 +529,7 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
             positive_ratio * 100, neutral_ratio * 100, negative_ratio * 100,
         )
 
-        # ── 5. Bulk-mark processed comments in MongoDB ──────────────────────────
-        # Write sentiment_label per-document so routers can filter directly in
-        # MongoDB instead of having to fetch and filter in Python.
-        now_utc = datetime.now(timezone.utc)
-        bulk_ops = [
-            UpdateOne(
-                {"_id": doc_id},
-                {
-                    "$set": {
-                        "sentiment_processed": True,
-                        "sentiment_processed_at": now_utc,
-                        "sentiment_label": category,
-                    }
-                },
-            )
-            for doc_id, category in zip(doc_ids, categories)
-        ]
-        if bulk_ops:
-            await comments_coll.bulk_write(bulk_ops, ordered=False)
-
-        # ── 6. Persist sentiment scores in PostgreSQL ─────────────────────────
+        # ── 5. Persist sentiment scores in PostgreSQL ─────────────────────────
         # Convert platform string to the Platform enum used by the ORM.
         try:
             platform_enum = Platform(platform.lower())

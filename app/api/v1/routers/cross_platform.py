@@ -35,11 +35,14 @@ GET /correlation-summary
 
 from __future__ import annotations
 
+import asyncio
 import re
 import string
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+_asyncio = asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -259,17 +262,80 @@ async def get_shared_videos(
 
     target_vid_id = _extract_video_id(video_url_or_id) if video_url_or_id else None
 
-    # 2. Extract all YouTube video IDs and build rich discussion records
-    # vid_id -> list of raw discussion docs
+    # 2A. Regex URL matching (fast-path)
     video_to_discussions: Dict[str, List[Dict[str, Any]]] = {}
-    
+    matched_comment_keys: set = set()
+
     for doc in reddit_docs:
         body = doc.get("body", "")
         matches = _YT_URL_RE.findall(body)
         for vid_id in set(matches):
             if target_vid_id and vid_id != target_vid_id:
                 continue
-            video_to_discussions.setdefault(vid_id, []).append(doc)
+            doc_copy = dict(doc)
+            doc_copy["match_type"] = "url"
+            doc_copy["similarity_score"] = 1.0
+            video_to_discussions.setdefault(vid_id, []).append(doc_copy)
+            c_key = doc.get("platform_id") or doc.get("permalink") or body
+            matched_comment_keys.add(c_key)
+
+    # 2B. Semantic Similarity Matching (Sentence-BERT fallback & supplement)
+    # Collect candidate YouTube videos to compare Reddit discussions against
+    candidate_videos_map: Dict[str, Dict[str, Any]] = {}
+
+    if target_vid_id:
+        target_payload = await payloads_coll.find_one(
+            {"platform": "youtube", "platform_id": target_vid_id},
+            {"_id": 0, "platform_id": 1, "title": 1, "stats": 1, "raw": 1},
+        )
+        if target_payload:
+            candidate_videos_map[target_vid_id] = target_payload
+        else:
+            candidate_videos_map[target_vid_id] = {"platform_id": target_vid_id, "title": target_vid_id}
+    else:
+        # Load indexed YouTube videos from MongoDB payloads (up to 50 videos)
+        cand_cursor = payloads_coll.find(
+            {"platform": "youtube"},
+            {"_id": 0, "platform_id": 1, "title": 1, "stats": 1, "raw": 1},
+        ).sort("ingested_at", -1).limit(50)
+        cand_docs = await cand_cursor.to_list(length=50)
+        for c_doc in cand_docs:
+            c_id = c_doc.get("platform_id")
+            if c_id:
+                candidate_videos_map[c_id] = c_doc
+
+        # Also register any video IDs that were already discovered via URL
+        for v_id in list(video_to_discussions.keys()):
+            if v_id not in candidate_videos_map:
+                candidate_videos_map[v_id] = {"platform_id": v_id, "title": v_id}
+
+    # Filter Reddit comments that did not match via URL
+    unmatched_reddit_docs = [
+        d for d in reddit_docs
+        if (d.get("platform_id") or d.get("permalink") or d.get("body")) not in matched_comment_keys
+    ]
+
+    if candidate_videos_map and unmatched_reddit_docs:
+        from app.services.analytics.semantic_matcher import get_semantic_matcher
+        from app.core.config import get_settings
+        current_settings = get_settings()
+
+        matcher = get_semantic_matcher()
+        candidate_list = list(candidate_videos_map.values())
+        sem_matches = matcher.match_discussions_to_videos(
+            unmatched_reddit_docs,
+            candidate_list,
+            threshold=current_settings.SEMANTIC_SIMILARITY_THRESHOLD,
+        )
+
+        for matched_vid, items in sem_matches.items():
+            if target_vid_id and matched_vid != target_vid_id:
+                continue
+            for disc_doc, score in items:
+                d_copy = dict(disc_doc)
+                d_copy["match_type"] = "semantic"
+                d_copy["similarity_score"] = score
+                video_to_discussions.setdefault(matched_vid, []).append(d_copy)
 
     if not video_to_discussions:
         return []
@@ -393,9 +459,9 @@ async def get_shared_videos(
         title = cached_yt.get("title") or live_yt.get("title")
         thumbnail_url = live_yt.get("thumbnail_url")
         channel_title = live_yt.get("channel_title")
-        yt_published_at = live_yt.get("published_at") or (
-            cached_yt.get("ingested_at").isoformat() if cached_yt.get("ingested_at") else None
-        )
+        ing_at = cached_yt.get("ingested_at")
+        ing_at_str = ing_at.isoformat() if hasattr(ing_at, "isoformat") else (str(ing_at) if ing_at else None)
+        yt_published_at = live_yt.get("published_at") or ing_at_str
         yt_tags = live_yt.get("tags", [])
 
         # Build Reddit discussions list
@@ -440,6 +506,8 @@ async def get_shared_videos(
                     permalink=r_doc.get("permalink"),
                     sentiment_label=label,
                     sentiment_score=r_doc.get("sentiment_score"),
+                    match_type=r_doc.get("match_type", "url"),
+                    similarity_score=r_doc.get("similarity_score"),
                 )
             )
 
@@ -516,6 +584,18 @@ async def get_shared_videos(
         reddit_topics = _extract_topics_from_texts(discussion_texts, top_n=4)
         combined_topics = list(dict.fromkeys(yt_tags[:4] + reddit_topics))
 
+        # Determine overall match_type and max_similarity
+        types = {d.get("match_type", "url") for d in raw_discussions}
+        if "url" in types and "semantic" in types:
+            overall_match_type = "hybrid"
+        elif "semantic" in types:
+            overall_match_type = "semantic"
+        else:
+            overall_match_type = "url"
+
+        scores = [d.get("similarity_score") for d in raw_discussions if d.get("similarity_score") is not None]
+        max_sim = max(scores) if scores else (1.0 if overall_match_type == "url" else None)
+
         shared.append(
             SharedVideoItem(
                 youtube_video_id=vid_id,
@@ -542,6 +622,8 @@ async def get_shared_videos(
                 sentiment_disparity_note=disparity_note,
                 reddit_discussions=reddit_discussions,
                 topics=combined_topics[:6],
+                match_type=overall_match_type,
+                similarity_score=max_sim,
             )
         )
 
@@ -606,7 +688,10 @@ async def get_video_engagement(
     comment_count = stats.get("comment_count")
     thumbnail_url = None
     channel_title = None
-    yt_published_at = yt_payload.get("ingested_at").isoformat() if yt_payload and yt_payload.get("ingested_at") else None
+    yt_ing_at = yt_payload.get("ingested_at") if yt_payload else None
+    yt_published_at = (
+        yt_ing_at.isoformat() if hasattr(yt_ing_at, "isoformat") else (str(yt_ing_at) if yt_ing_at else None)
+    )
     yt_tags: List[str] = []
 
     # If missing full details, query YouTube Data API v3 live
@@ -675,7 +760,41 @@ async def get_video_engagement(
             d_id = doc.get("platform_id")
             if d_id and d_id not in seen_discussion_ids:
                 seen_discussion_ids.add(d_id)
-                matched_discussions.append(doc)
+                d_copy = dict(doc)
+                d_copy["match_type"] = "url"
+                d_copy["similarity_score"] = 1.0
+                matched_discussions.append(d_copy)
+
+    # Semantic similarity matching on remaining local Reddit comments
+    unmatched_local_docs = [
+        d for d in all_reddit_docs
+        if (d.get("platform_id") or d.get("permalink") or d.get("body")) not in seen_discussion_ids
+    ]
+    if unmatched_local_docs and (title or yt_tags):
+        from app.services.analytics.semantic_matcher import get_semantic_matcher
+        from app.core.config import get_settings
+        current_settings = get_settings()
+
+        matcher = get_semantic_matcher()
+        cand_video = [{
+            "video_id": vid_id,
+            "title": title or "",
+            "description": " ".join(yt_tags) if yt_tags else "",
+        }]
+        sem_matches = matcher.match_discussions_to_videos(
+            unmatched_local_docs,
+            cand_video,
+            threshold=current_settings.SEMANTIC_SIMILARITY_THRESHOLD,
+        )
+        for _, disc_list in sem_matches.items():
+            for d_doc, score in disc_list:
+                d_id = d_doc.get("platform_id") or d_doc.get("permalink") or d_doc.get("body")
+                if d_id not in seen_discussion_ids:
+                    seen_discussion_ids.add(d_id)
+                    d_copy = dict(d_doc)
+                    d_copy["match_type"] = "semantic"
+                    d_copy["similarity_score"] = score
+                    matched_discussions.append(d_copy)
 
     # 2B. Search the ENTIRE Reddit platform live via PRAW (reddit.subreddit('all').search)
     try:
@@ -829,6 +948,8 @@ async def get_video_engagement(
                 permalink=r_doc.get("permalink"),
                 sentiment_label=label,
                 sentiment_score=r_doc.get("sentiment_score"),
+                match_type=r_doc.get("match_type", "url"),
+                similarity_score=r_doc.get("similarity_score"),
             )
         )
 

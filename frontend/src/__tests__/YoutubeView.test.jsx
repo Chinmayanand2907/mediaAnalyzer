@@ -77,4 +77,59 @@ describe('YoutubeView Component', () => {
     // Verify Comments loaded
     expect(screen.getByText('Great video!')).toBeInTheDocument();
   });
+
+  it('shows validation error for invalid channel IDs and keeps Ingest disabled', async () => {
+    apiClient.fetchYoutubeChannels.mockResolvedValue([]);
+    apiClient.fetchYoutubeChannel.mockResolvedValue(null);
+    apiClient.fetchYoutubeSentiment.mockResolvedValue(null);
+    apiClient.fetchYoutubeComments.mockResolvedValue([]);
+
+    render(<YoutubeView />);
+    const user = userEvent.setup();
+
+    // Open the input mode
+    const addBtn = await screen.findByTitle('Add a new channel by ID');
+    await user.click(addBtn);
+
+    const input = screen.getByPlaceholderText(/UCxxxxxxxxxxxxxxxxxxxxxxxxx/i);
+    const ingestBtn = screen.getByRole('button', { name: /Ingest/i });
+
+    const invalidInputs = ['mkbhd', '@MrBeast', 'UCshort', 'ACxxxxxxxxxxxxxxxxxxxxxxxx'];
+    for (const bad of invalidInputs) {
+      await user.clear(input);
+      await user.type(input, bad);
+      expect(screen.getByText(/Must start with "UC" and be exactly 24 characters/i)).toBeInTheDocument();
+      expect(ingestBtn).toBeDisabled();
+    }
+  });
+
+  it('clears validation error and enables Ingest for a valid Channel ID', async () => {
+    apiClient.fetchYoutubeChannels.mockResolvedValue([]);
+    apiClient.fetchYoutubeChannel.mockResolvedValue(null);
+    apiClient.fetchYoutubeSentiment.mockResolvedValue(null);
+    apiClient.fetchYoutubeComments.mockResolvedValue([]);
+    apiClient.triggerYoutubeIngest.mockResolvedValue({ task_id: 'task-1', message: 'ok' });
+
+    render(<YoutubeView />);
+    const user = userEvent.setup();
+
+    const addBtn = await screen.findByTitle('Add a new channel by ID');
+    await user.click(addBtn);
+
+    const input = screen.getByPlaceholderText(/UCxxxxxxxxxxxxxxxxxxxxxxxxx/i);
+    const ingestBtn = screen.getByRole('button', { name: /Ingest/i });
+
+    // Type an invalid ID first
+    await user.type(input, 'mkbhd');
+    expect(ingestBtn).toBeDisabled();
+
+    // Clear and type a valid Channel ID (exactly 24 chars starting with UC)
+    await user.clear(input);
+    await user.type(input, 'UCBcRF18a7Qf58cCRy5xuWwQ');
+
+    // Error should be gone; Ingest should be enabled
+    expect(screen.queryByText(/Must start with "UC"/i)).not.toBeInTheDocument();
+    expect(ingestBtn).not.toBeDisabled();
+  });
 });
+
