@@ -24,3 +24,8 @@ tests/
 
 # Local secrets (injected via env in compose)
 .env
+*.rdb
+dump.rdb
+verify_celery_pipeline.py
+start_dbs.sh
+stop_dbs.sh

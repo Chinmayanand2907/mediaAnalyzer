@@ -20,12 +20,15 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes cache TTL
 
 /**
  * Generate a deterministic cache key based on function identifier & serialized deps.
+ * Pass an explicit `customKey` whenever the fetcher is an inline closure —
+ * anonymous closures have empty .name and minified source collides.
  */
 function createCacheKey(fetchFn, deps, customKey) {
   if (customKey) return `custom:${customKey}`;
-  const fnId = fetchFn?.name || fetchFn?.toString()?.slice(0, 80)?.replace(/\s+/g, ' ') || 'fn';
+  const fnId = fetchFn?.name || 'fn';
+  const fnSrc = (fetchFn?.toString?.() || '').slice(0, 500).replace(/\s+/g, ' ');
   const depsKey = JSON.stringify(deps || []);
-  return `${fnId}::${depsKey}`;
+  return `${fnId}::${fnSrc}::${depsKey}`;
 }
 
 /**
@@ -63,6 +66,18 @@ export function useAnalytics(
   const [loading, setLoading] = useState(() => (cached == null && enabled));
   const [error, setError] = useState(null);
   const fetchFnRef = useRef(fetchFn);
+
+  // Reset stale data/error when disabled (e.g. filter cleared) so old
+  // channel/video metrics are not shown as current.
+  const wasEnabledRef = useRef(enabled);
+  useEffect(() => {
+    if (wasEnabledRef.current && !enabled) {
+      setData(initialData);
+      setError(null);
+      setLoading(false);
+    }
+    wasEnabledRef.current = enabled;
+  }, [enabled, initialData]);
 
   // Keep the ref fresh without triggering re-runs.
   useEffect(() => {
@@ -112,7 +127,7 @@ export function useAnalytics(
         setLoading(false);
       })
       .catch((err) => {
-        if (err.name === 'CanceledError' || err.name === 'AbortError') return;
+        if (err?.name === 'CanceledError' || err?.name === 'AbortError' || err?.code === 'ERR_CANCELED') return;
         setError(err.message ?? 'Something went wrong');
         setLoading(false);
       });

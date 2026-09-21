@@ -89,8 +89,17 @@ _URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _as_utc(dt: datetime) -> datetime:
-    """Return *dt* as a timezone-aware UTC datetime regardless of its original tzinfo."""
+def _as_utc(dt) -> datetime | None:
+    """Return *dt* as timezone-aware UTC. Accepts datetime or ISO-8601 string."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(dt, datetime):
+        return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -407,10 +416,15 @@ async def trigger_reddit_ingest(subreddit_name: str) -> TaskEnqueuedResponse:
     MongoDB + Postgres.
     """
     clean_sub = _clean_sub_name(subreddit_name)
+    if not clean_sub or len(clean_sub) < 2 or len(clean_sub) > 24 or not re.fullmatch(r"[A-Za-z0-9_]+", clean_sub):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid subreddit name '{subreddit_name}'. Use 2-24 chars: letters, numbers, underscore.",
+        )
     try:
         task = celery_app.send_task(
             "app.tasks.ingestion_tasks.tasks_ingest_reddit_data",
-            args=[subreddit_name],
+            args=[clean_sub],
         )
     except Exception as exc:
         raise HTTPException(
@@ -420,6 +434,6 @@ async def trigger_reddit_ingest(subreddit_name: str) -> TaskEnqueuedResponse:
 
     return TaskEnqueuedResponse(
         task_id=task.id,
-        message=f"Ingestion task queued for 'r/{subreddit_name}'. "
+        message=f"Ingestion task queued for 'r/{clean_sub}'. "
                 "Data will be available within a few seconds.",
     )

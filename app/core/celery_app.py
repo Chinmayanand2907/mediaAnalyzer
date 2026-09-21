@@ -57,6 +57,12 @@ celery_app.conf.update(
     task_track_started=True,
     task_time_limit=3600,           # hard kill after 1 hour
     task_soft_time_limit=3300,      # SIGTERM warning 5 min before hard kill
+    task_default_queue="celery",
+    task_routes={
+        "app.tasks.ingestion_tasks.tasks_ingest_youtube_data": {"queue": "youtube"},
+        "app.tasks.ingestion_tasks.tasks_ingest_reddit_data": {"queue": "reddit"},
+        "app.tasks.ingestion_tasks.task_process_sentiment": {"queue": "celery"},
+    },
 )
 
 # ─── NLP Model Globals ────────────────────────────────────────────────────────

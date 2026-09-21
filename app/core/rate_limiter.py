@@ -59,11 +59,11 @@ tokens = math.min(capacity, tokens + elapsed * refill_rate)
 
 if tokens >= requested then
     tokens = tokens - requested
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
     redis.call('EXPIRE', key, 120)
     return 1    -- granted
 else
-    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('HSET', key, 'tokens', tokens, 'last_refill', now)
     redis.call('EXPIRE', key, 120)
     return 0    -- denied
 end
@@ -98,6 +98,7 @@ class TokenBucketRateLimiter:
         self._refill_rate = refill_rate
         self._max_wait = max_wait
         self._script: aioredis.client.Script | None = None
+        self._redis: aioredis.Redis | None = None
 
         # In-memory fallback state
         self._mem_tokens: float = float(capacity)
@@ -105,32 +106,44 @@ class TokenBucketRateLimiter:
         self._mem_lock = asyncio.Lock()
 
     def _get_redis(self) -> aioredis.Redis:
+        # Reuse a single client instead of opening a new pool per acquire().
         settings = get_settings()
-        return aioredis.from_url(
-            settings.REDIS_URL,
-            encoding="utf-8",
-            decode_responses=True,
-            socket_connect_timeout=2,
-            socket_timeout=2,
-        )
+        if self._redis is None:
+            self._redis = aioredis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+        return self._redis
 
-    async def _redis_acquire(self) -> bool:
-        """Try to consume one token from Redis. Returns True if granted."""
+    async def aclose(self) -> None:
+        if self._redis is not None:
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
+            self._redis = None
+            self._script = None
+
+    async def _redis_acquire(self, tokens: int = 1) -> bool:
+        """Try to consume *tokens* from Redis. Returns True if granted."""
         try:
             client = self._get_redis()
             if self._script is None:
                 self._script = client.register_script(_LUA_TOKEN_BUCKET)
             result = await self._script(
                 keys=[self._key],
-                args=[self._capacity, self._refill_rate, 1, time.time()],
+                args=[self._capacity, self._refill_rate, tokens, time.time()],
             )
             return bool(result)
         except Exception as exc:
             logger.warning("Rate limiter Redis error — falling back to in-memory: %s", exc)
-            return await self._mem_acquire()
+            return await self._mem_acquire(tokens)
 
-    async def _mem_acquire(self) -> bool:
-        """Attempt to consume a token from the in-memory bucket (fallback)."""
+    async def _mem_acquire(self, tokens: int = 1) -> bool:
+        """Attempt to consume tokens from the in-memory bucket (fallback)."""
         async with self._mem_lock:
             now = time.monotonic()
             elapsed = now - self._mem_last_refill
@@ -140,8 +153,8 @@ class TokenBucketRateLimiter:
             )
             self._mem_last_refill = now
 
-            if self._mem_tokens >= 1:
-                self._mem_tokens -= 1
+            if self._mem_tokens >= tokens:
+                self._mem_tokens -= tokens
                 return True
             return False
 
@@ -157,7 +170,7 @@ class TokenBucketRateLimiter:
         sleep_interval = 0.05  # 50 ms initial poll interval
 
         while True:
-            granted = await self._redis_acquire()
+            granted = await self._redis_acquire(tokens)
             if granted:
                 return
 

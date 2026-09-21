@@ -24,7 +24,12 @@ FROM python:3.12-slim AS runtime
 WORKDIR /app
 
 # Runtime system libs
+# curl: required for compose healthcheck (curl -f /health)
+# libgomp1: required by torch/xgboost/scikit-learn (OpenMP)
+# libpq5: required by asyncpg/psycopg
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libgomp1 \
     libpq5 \
   && rm -rf /var/lib/apt/lists/*
 

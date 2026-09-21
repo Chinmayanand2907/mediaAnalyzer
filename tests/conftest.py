@@ -7,13 +7,15 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from mongomock_motor import AsyncMongoMockClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel
 
 # Set test environment variable so get_settings() returns test config
 os.environ["APP_ENV"] = "development"
-os.environ["REDIS_URL"] = "redis://localhost:6379/1"
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+os.environ["CELERY_BROKER_URL"] = "redis://localhost:6379/15"
+os.environ["CELERY_RESULT_BACKEND"] = "redis://localhost:6379/15"
 # NOTE: POSTGRES_DSN is a @computed_field in Settings — it cannot be overridden
 # via env var. The test DB engine below is wired directly via dependency_overrides.
 os.environ["MONGO_URI"] = "mongodb://localhost:27017"
@@ -32,14 +34,17 @@ from app.db import mongodb
 # ─── Database Fixtures ────────────────────────────────────────────────────────
 
 # Use a memory SQLite database for SQLModel/Postgres tests
+# StaticPool keeps a single shared connection so :memory: tables are
+# visible across sessions (otherwise DDL on one conn is invisible on another).
 test_engine = create_async_engine(
     "sqlite+aiosqlite:///:memory:",
     echo=False,
     future=True,
     connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
 )
 
-TestSessionLocal = sessionmaker(
+TestSessionLocal = async_sessionmaker(
     bind=test_engine,
     class_=AsyncSession,
     expire_on_commit=False,
@@ -48,6 +53,12 @@ TestSessionLocal = sessionmaker(
 async def override_get_db_session() -> AsyncGeneratorType[AsyncSession, None]:
     async with TestSessionLocal() as session:
         yield session
+
+@pytest.fixture(autouse=True)
+def _clean_dependency_overrides():
+    yield
+    app.dependency_overrides.clear()
+    app.dependency_overrides[get_db_session] = override_get_db_session
 
 @pytest_asyncio.fixture(scope="function")
 async def db_session() -> AsyncGeneratorType[AsyncSession, None]:

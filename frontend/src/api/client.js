@@ -8,22 +8,31 @@
 
 import axios from 'axios';
 
+const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1';
+
 const api = axios.create({
-  baseURL: '/api/v1',
-  timeout: 15000,
+  baseURL: API_BASE,
+  timeout: 30000,
   headers: { 'Content-Type': 'application/json' },
 });
 
 // ── Response interceptor: unwrap data, surface errors cleanly ──────────────
+// Preserves abort/status info so callers can branch on 404/422/503 and
+// useAnalytics can ignore CanceledError/AbortError.
 api.interceptors.response.use(
   (res) => res.data,
   (err) => {
-    const message =
-      err.response?.data?.detail ||
-      err.response?.data?.message ||
-      err.message ||
-      'Unknown API error';
-    return Promise.reject(new Error(message));
+    const rawDetail = err.response?.data?.detail ?? err.response?.data?.message;
+    const message = Array.isArray(rawDetail)
+      ? rawDetail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+      : rawDetail || err.message || 'Unknown API error';
+    const wrapped = new Error(message);
+    wrapped.name = err.name || 'Error';
+    wrapped.code = err.code;
+    wrapped.status = err.response?.status;
+    wrapped.response = err.response;
+    wrapped.config = err.config;
+    return Promise.reject(wrapped);
   }
 );
 
@@ -95,6 +104,7 @@ export const fetchVideoCrossPlatformEngagement = (videoUrlOrId, commentScanLimit
   api.get('/cross-platform/video-engagement', {
     params: { video_url_or_id: videoUrlOrId, comment_scan_limit: commentScanLimit },
     signal,
+    timeout: 60000,
   });
 
 export const fetchTopVideos = (topic, maxResults = 10, signal) =>

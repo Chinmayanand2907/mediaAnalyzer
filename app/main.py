@@ -16,8 +16,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
-from app.db.postgres import init_postgres
+from app.db.postgres import dispose_engine, init_postgres
 from app.db.mongodb import close_mongo, connect_mongo, ensure_indexes
+from app.core.cache import close_cache
 
 # ── v1 routers ────────────────────────────────────────────────────────────────
 from app.api.v1.routers.youtube import router as youtube_router
@@ -43,6 +44,8 @@ async def lifespan(app: FastAPI):
     yield
     # ── Shutdown ─────────────────────────────────────────────
     await close_mongo()
+    await close_cache()
+    await dispose_engine()
     logger.info("👋  Shutting down…")
 
 

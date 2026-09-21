@@ -145,9 +145,10 @@ services:
     container_name: engageiq-frontend
     restart: unless-stopped
     environment:
-      # Vite uses VITE_ prefix for client-side vars; none needed here
-      # The proxy in vite.config.js forwards /api → web-backend:8000
-      VITE_API_BASE: http://web-backend:8000
+      # Vite dev proxy target *inside* the container (Docker DNS).
+      # Browser calls use relative /api/v1 so VITE_API_BASE is only a fallback.
+      VITE_API_TARGET: http://web-backend:8000
+      VITE_API_BASE: http://localhost:8000
     ports:
       - "5173:5173"
     networks:

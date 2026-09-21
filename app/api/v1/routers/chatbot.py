@@ -160,7 +160,7 @@ async def _fetch_youtube_context() -> str:
             lines.append(f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}")
             lines.append(f"    Total Views: {_fmt(stats.get('views'))}")
             lines.append(f"    Total Likes: {_fmt(stats.get('likes'))}")
-            lines.append(f"    Total Videos: {_fmt(stats.get('videos'))}")
+            lines.append(f"    Total Videos: {_fmt(stats.get('videos') or stats.get('video_count'))}")
             lines.append(f"    Tracked Comments: {_fmt(total_comments)}")
             if analyzed > 0:
                 lines.append(
@@ -255,7 +255,6 @@ async def _fetch_reddit_context() -> str:
 
             lines.append(f"\n  r/{name} (internal ID: {sub_id})")
             lines.append(f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}")
-            lines.append(f"    Total Posts Tracked: {_fmt(stats.get('posts', stats.get('total_posts')))}")
             lines.append(f"    Tracked Comments in DB: {_fmt(total_comments)}")
             if analyzed > 0:
                 lines.append(

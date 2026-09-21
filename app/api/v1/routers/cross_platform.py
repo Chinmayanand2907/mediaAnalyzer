@@ -83,7 +83,7 @@ def _extract_video_id(input_str: Any) -> Optional[str]:
     clean = re.sub(r"[^A-Za-z0-9_\-]", "", input_str)
     if len(clean) == 11:
         return clean
-    return input_str
+    return None
 
 
 # Common stopwords for topic / keyword extraction
@@ -172,21 +172,27 @@ def _normalise_engagement(raw: Dict[str, Any], platform: str) -> float:
     import math
 
     if platform == "youtube":
-        views = max(1, int(raw.get("views", 0)))
-        likes = max(0, int(raw.get("likes", 0)))
-        comments = max(0, int(raw.get("comments", 0)))
+        views = max(1, int(raw.get("views") or 0))
+        likes = max(0, int(raw.get("likes") or 0))
+        comments = max(0, int(raw.get("comments") or raw.get("comment_count") or 0))
         like_ratio = min(likes / views, 1.0)
         comment_ratio = min(comments / views, 1.0)
         log_views = math.log10(views)
         score = (log_views / 7) * (like_ratio * 50 + comment_ratio * 50)
 
     elif platform == "reddit":
-        upvotes = max(1, int(raw.get("upvotes", raw.get("members", 0))))
-        comments = max(0, int(raw.get("comments", 0)))
-        total = max(1, upvotes + comments)
-        comment_ratio = min(comments / total, 1.0)
+        upvotes = max(1, int(raw.get("upvotes") or raw.get("members") or raw.get("subscribers") or 0))
+        comments = max(0, int(raw.get("comments") or 0))
+        # members-only snapshots have no comment count — score on audience size alone
+        # instead of multiplying by a zero comment_ratio.
         log_ups = math.log10(upvotes)
-        score = (log_ups / 6) * (comment_ratio * 100)
+        if comments > 0:
+            total = max(1, upvotes + comments)
+            comment_ratio = min(comments / total, 1.0)
+            # Blend reach (50%) with discussion intensity (50%)
+            score = (log_ups / 6) * (50 + comment_ratio * 50)
+        else:
+            score = (log_ups / 6) * 50
 
     else:
         score = 0.0
@@ -232,7 +238,7 @@ async def get_shared_videos(
     query_filter: Dict[str, Any] = {"platform": "reddit"}
     if subreddit_name:
         clean_sub = subreddit_name.strip().lstrip("/").replace("r/", "").replace("/r/", "").strip().lower()
-        query_filter["parent_id"] = clean_sub
+        query_filter["parent_id"] = {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}
 
     cursor = (
         comments_coll
@@ -439,7 +445,7 @@ async def get_shared_videos(
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
-            batch_res = svc.analyze_batch(unlabeled_bodies[:100])
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_bodies[:100])
             for text, res in zip(unlabeled_bodies[:100], batch_res):
                 quick_sentiment_map[text] = res.label.value
         except Exception:
@@ -907,7 +913,7 @@ async def get_video_engagement(
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
-            batch_res = svc.analyze_batch(unlabeled_bodies[:50])
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_bodies[:50])
             for text, res in zip(unlabeled_bodies[:50], batch_res):
                 quick_sentiment_map[text] = res.label.value
         except Exception:
@@ -1081,7 +1087,7 @@ async def get_sentiment_comparison(
     clean_sub = None
     if subreddit_name:
         clean_sub = subreddit_name.strip().lstrip("/").replace("r/", "").replace("/r/", "").strip().lower()
-        rd_filter["parent_id"] = clean_sub
+        rd_filter["parent_id"] = {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}
 
     vid_id = _extract_video_id(video_url_or_id) if video_url_or_id else None
 
@@ -1097,7 +1103,7 @@ async def get_sentiment_comparison(
 
     if len(rd_labels) < 5 and unlabeled_rd:
         try:
-            batch_res = svc.analyze_batch(unlabeled_rd[:40])
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_rd[:40])
             rd_labels.extend([r.label.value for r in batch_res])
         except Exception:
             pass
@@ -1112,7 +1118,7 @@ async def get_sentiment_comparison(
                 det = await reddit_client.fetch_post_details(t.post_id, comment_limit=10)
                 live_bodies.extend([c.body for c in det.comments if c.body])
             if live_bodies:
-                batch_res = svc.analyze_batch(live_bodies[:30])
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_bodies[:30])
                 rd_labels.extend([r.label.value for r in batch_res])
         except Exception:
             pass
@@ -1131,7 +1137,7 @@ async def get_sentiment_comparison(
 
     if len(yt_labels) < 5 and unlabeled_yt:
         try:
-            batch_res = svc.analyze_batch(unlabeled_yt[:40])
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_yt[:40])
             yt_labels.extend([r.label.value for r in batch_res])
         except Exception:
             pass
@@ -1154,7 +1160,7 @@ async def get_sentiment_comparison(
                         if text:
                             live_yt_bodies.append(text)
             if live_yt_bodies:
-                batch_res = svc.analyze_batch(live_yt_bodies[:30])
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:30])
                 yt_labels.extend([r.label.value for r in batch_res])
         except Exception:
             pass
@@ -1214,7 +1220,7 @@ async def get_topic_correlation(
     rd_filter: Dict[str, Any] = {"platform": "reddit"}
     if subreddit_name:
         clean_sub = subreddit_name.strip().lstrip("/").replace("r/", "").replace("/r/", "").strip().lower()
-        rd_filter["parent_id"] = clean_sub
+        rd_filter["parent_id"] = {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}
 
     rd_cursor = comments_coll.find(rd_filter, {"_id": 0, "body": 1}).limit(300)
     rd_docs = await rd_cursor.to_list(length=300)

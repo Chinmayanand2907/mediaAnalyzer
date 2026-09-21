@@ -153,14 +153,15 @@ async def ensure_indexes() -> None:
     # ── Comments collection ──────────────────────────────────
     comments = db["comments"]
     await comments.create_index("platform")
-    await comments.create_index("platform_id", unique=True)
+    # Compound unique key: same native ID may exist on both platforms.
+    await comments.create_index([("platform", 1), ("platform_id", 1)], unique=True)
     await comments.create_index("parent_id")
     await comments.create_index("ingested_at")
 
     # ── Video payloads collection ────────────────────────────
     payloads = db["video_payloads"]
     await payloads.create_index("platform")
-    await payloads.create_index("platform_id", unique=True)
+    await payloads.create_index([("platform", 1), ("platform_id", 1)], unique=True)
     await payloads.create_index("ingested_at")
 
     logger.info("📇  MongoDB indexes ensured.")

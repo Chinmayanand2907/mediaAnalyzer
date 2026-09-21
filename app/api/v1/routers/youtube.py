@@ -56,8 +56,17 @@ def _get_sentiment_svc() -> SentimentService:
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _as_utc(dt: datetime) -> datetime:
-    """Return *dt* as a timezone-aware UTC datetime regardless of its original tzinfo."""
+def _as_utc(dt) -> datetime | None:
+    """Return *dt* as timezone-aware UTC. Accepts datetime or ISO-8601 string."""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if not isinstance(dt, datetime):
+        return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)

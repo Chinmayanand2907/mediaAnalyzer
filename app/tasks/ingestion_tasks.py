@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 import certifi
 from celery import shared_task
+from app.core.celery_app import celery_app as _celery_app
 from celery.utils.log import get_task_logger
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
@@ -127,14 +128,28 @@ async def _ingest_youtube_data_async(channel_id: str) -> None:
 
         # ── 3. Fetch comments from recent videos ──────────────────────────
         logger.info(f"Fetching comments for {len(video_ids)} videos from channel {canonical_channel_id}")
-        total_likes = 0
+        comment_ops = []
+        comment_count = 0
+        sampled_comment_likes = 0
+        video_likes_total = 0
+        video_comments_total = 0
+
+        # Aggregate true video-level likes/comments (1 unit per video)
+        for vid_id in video_ids[:5]:
+            try:
+                meta = await yt.fetch_video_metadata(vid_id)
+                video_likes_total += meta.statistics.like_count or 0
+                video_comments_total += meta.statistics.comment_count or 0
+            except Exception:
+                continue
 
         for vid_id in video_ids[:5]:  # limit to 5 videos to save API quota
             try:
                 threads_resp = await yt.fetch_comment_threads(vid_id, max_results=50)
                 for thread in threads_resp.threads:
                     top = thread.top_comment
-                    total_likes += top.like_count
+                    sampled_comment_likes += top.like_count
+                    comment_count += 1
                     comment_doc = {
                         "platform":     "youtube",
                         "platform_id":  top.comment_id,
@@ -147,14 +162,17 @@ async def _ingest_youtube_data_async(channel_id: str) -> None:
                         "raw":          {},
                         "ingested_at":  datetime.now(timezone.utc),
                     }
-                    await comments_coll.update_one(
+                    comment_ops.append(UpdateOne(
                         {"platform": "youtube", "platform_id": top.comment_id},
                         {"$set": comment_doc},
                         upsert=True,
-                    )
+                    ))
             except YouTubeAPIError as e:
                 logger.warning(f"Skipping comments for video {vid_id}: {e}")
                 continue
+
+        if comment_ops:
+            await comments_coll.bulk_write(comment_ops, ordered=False)
 
         # ── 4. Store channel payload in MongoDB ───────────────────────────
         logger.info(f"Storing YouTube payload in MongoDB for {canonical_channel_id}")
@@ -164,8 +182,13 @@ async def _ingest_youtube_data_async(channel_id: str) -> None:
             "title":       display_name,
             "stats": {
                 "views":       view_count,
-                "likes":       total_likes,
+                # True video-level likes summed across sampled videos;
+                # sampled comment likes kept separately to avoid mislabeling.
+                "likes":       video_likes_total,
                 "video_count": video_count,
+                "comment_count": video_comments_total,
+                "comments_sampled": comment_count,
+                "comment_likes_sampled": sampled_comment_likes,
             },
             "raw": {"description": description},
             "ingested_at": datetime.now(timezone.utc),
@@ -372,8 +395,10 @@ def _roberta_label_to_category(label: str) -> str:
         return "positive"
     if label_lower in ("label_1", "neutral"):
         return "neutral"
-    # LABEL_0, "negative", or any unexpected label → negative
-    return "negative"
+    if label_lower in ("label_0", "negative"):
+        return "negative"
+    # Unknown future labels default to neutral to avoid negative bias
+    return "neutral"
 
 
 def _vader_compound_to_category(compound: float) -> str:
@@ -561,7 +586,8 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                 )
             else:
                 # Merge sentiment scores into the existing extra_metadata JSON blob.
-                existing_meta: dict = account.extra_metadata or {}
+                # Copy to a new dict so SQLAlchemy flags the JSON column dirty.
+                existing_meta: dict = dict(account.extra_metadata or {})
                 # Ensure it's a dict just in case
                 if not isinstance(existing_meta, dict):
                     existing_meta = {}
@@ -599,8 +625,10 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
 
 
 # ─── Celery Tasks ───────────────────────────────────────────────────────────
+# NOTE: bind explicitly to the canonical app so workers started with
+# `celery -A app.core.celery_app worker` always see these tasks.
 
-@shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_youtube_data")
+@_celery_app.task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_youtube_data")
 def tasks_ingest_youtube_data(self, channel_id: str) -> str:
     """
     Celery task to ingest YouTube data.
@@ -625,7 +653,7 @@ def tasks_ingest_youtube_data(self, channel_id: str) -> str:
         raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
 
 
-@shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_reddit_data")
+@_celery_app.task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.tasks_ingest_reddit_data")
 def tasks_ingest_reddit_data(self, subreddit_name: str) -> str:
     """
     Celery task to ingest Reddit data.
@@ -640,7 +668,7 @@ def tasks_ingest_reddit_data(self, subreddit_name: str) -> str:
         raise self.retry(exc=exc, countdown=2 ** self.request.retries * 30)
 
 
-@shared_task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.task_process_sentiment")
+@_celery_app.task(bind=True, max_retries=3, name="app.tasks.ingestion_tasks.task_process_sentiment")
 def task_process_sentiment(self, platform: str, target_id: str) -> str:
     """
     Celery task: run sentiment analysis on all unprocessed comments for a
@@ -677,9 +705,9 @@ def task_process_sentiment(self, platform: str, target_id: str) -> str:
         summary = (
             f"Sentiment analysis complete for {platform}/{target_id}: "
             f"{result['total']} comment(s) processed — "
-            f"positive={result['positive_pct']}% | "
-            f"neutral={result['neutral_pct']}% | "
-            f"negative={result['negative_pct']}%"
+            f"positive={result['positive_pct'] * 100:.1f}% | "
+            f"neutral={result['neutral_pct'] * 100:.1f}% | "
+            f"negative={result['negative_pct'] * 100:.1f}%"
         )
         logger.info("[Sentiment Task] %s", summary)
         return summary

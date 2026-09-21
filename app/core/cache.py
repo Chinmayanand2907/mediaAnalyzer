@@ -24,6 +24,7 @@ Design
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -38,12 +39,18 @@ logger = logging.getLogger(__name__)
 # Module-level lazy singleton
 # ---------------------------------------------------------------------------
 _redis: aioredis.Redis | None = None
+_redis_loop = None
 
 
 def _get_redis_client() -> aioredis.Redis:
     """Return (and lazily create) the process-level Redis async client."""
-    global _redis
-    if _redis is None:
+    global _redis, _redis_loop
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    # Recreate if the loop changed (e.g. Celery asyncio.run per task) or closed.
+    if _redis is None or _redis_loop is not current_loop:
         settings = get_settings()
         _redis = aioredis.from_url(
             settings.REDIS_URL,
@@ -52,7 +59,20 @@ def _get_redis_client() -> aioredis.Redis:
             socket_connect_timeout=2,
             socket_timeout=2,
         )
+        _redis_loop = current_loop
     return _redis
+
+
+async def close_cache() -> None:
+    """Close the shared Redis client (call on app shutdown)."""
+    global _redis, _redis_loop
+    if _redis is not None:
+        try:
+            await _redis.aclose()
+        except Exception as exc:
+            logger.warning("Cache close error: %s", exc)
+        _redis = None
+        _redis_loop = None
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +150,24 @@ class RedisCache:
         try:
             client = _get_redis_client()
             full_key = self._key(key)
-            pipe = client.pipeline()
-            pipe.incrby(full_key, amount)
-            if ttl is not None:
-                # Only set TTL if the key doesn't already have one (new key).
-                pipe.expire(full_key, ttl, nx=True)
-            results = await pipe.execute()
-            return int(results[0])
+            # Fast path: INCR + EXPIRE NX (Redis >= 7.0). Fall back for older servers.
+            try:
+                pipe = client.pipeline()
+                pipe.incrby(full_key, amount)
+                if ttl is not None:
+                    # Only set TTL if the key doesn't already have one (new key).
+                    pipe.expire(full_key, ttl, nx=True)
+                results = await pipe.execute()
+                return int(results[0])
+            except Exception:
+                new_val = int(await client.incrby(full_key, amount))
+                if ttl is not None:
+                    try:
+                        if await client.ttl(full_key) == -1:
+                            await client.expire(full_key, ttl)
+                    except Exception:
+                        pass
+                return new_val
         except Exception as exc:
             logger.warning("Cache INCR error for '%s': %s", key, exc)
             return 0

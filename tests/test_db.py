@@ -23,21 +23,21 @@ async def test_postgres_init_success():
         mock_conn.run_sync.assert_called_once_with(SQLModel.metadata.create_all)
 
 async def test_postgres_get_db_session():
-    """Test that get_db_session yields an AsyncSession and commits/rolls back properly."""
+    """Test that get_db_session yields an AsyncSession and rolls back on error (no auto-commit)."""
     mock_session = AsyncMock(spec=AsyncSession)
     mock_session.__aenter__.return_value = mock_session
-    
+
     with patch("app.db.postgres.AsyncSessionLocal", return_value=mock_session):
-        # 1. Test success path (should commit)
+        # 1. Test success path (read-only: must NOT auto-commit)
         generator = get_db_session()
         yielded_session = await generator.__anext__()
         assert yielded_session is mock_session
-        
+
         # Simulating generator exit on success
         with pytest.raises(StopAsyncIteration):
             await generator.__anext__()
-        
-        mock_session.commit.assert_called_once()
+
+        mock_session.commit.assert_not_called()
         mock_session.rollback.assert_not_called()
 
 async def test_postgres_get_db_session_rollback():

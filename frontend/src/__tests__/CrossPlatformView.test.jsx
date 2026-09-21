@@ -83,7 +83,8 @@ describe('CrossPlatformView Component', () => {
     expect(await screen.findByText('Cross-Platform Analysis')).toBeInTheDocument();
     expect(screen.getByText('Subreddits Discussing')).toBeInTheDocument();
     expect(screen.getByText('Reddit Discussions')).toBeInTheDocument();
-    expect(screen.getByText('Video Views & Likes')).toBeInTheDocument();
+    expect(screen.getByText('YouTube Reach')).toBeInTheDocument();
+    expect(screen.getByText('Viral Latency')).toBeInTheDocument();
 
     expect((await screen.findAllByText(/Never Gonna Give You Up/i)).length).toBeGreaterThan(0);
     expect(screen.getAllByText('Rick Astley').length).toBeGreaterThan(0);

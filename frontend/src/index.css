@@ -126,6 +126,12 @@ body {
   to   { transform: rotate(360deg); }
 }
 
+/* ── Pulse Animation (for LIVE badge dot) ─────────────────────────────────── */
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.55; transform: scale(1.35); }
+}
+
 /* ── Sentiment Badges ─────────────────────────────────────────────────────── */
 .badge-positive {
   background: rgba(34, 197, 94, 0.15);

@@ -53,6 +53,7 @@ class SemanticMatcher:
         self._model = None
         self._model_load_attempted = False
         self._fallback_mode = False
+        self._tfidf_vectorizer = None
 
     def _get_model(self):
         """Lazy load the SentenceTransformer model with fallback."""
@@ -105,18 +106,43 @@ class SemanticMatcher:
         return self._encode_tfidf(safe_texts)
 
     def _encode_tfidf(self, texts: List[str]) -> np.ndarray:
-        """TF-IDF vectorizer fallback."""
+        """TF-IDF vectorizer fallback.
+
+        Uses a persistent vectorizer so separate encode() calls share the
+        same feature axes (required for meaningful cosine similarity).
+        First call fits; later calls transform (unknown words ignored).
+        Call reset_fallback() to refit on a new corpus.
+        """
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.preprocessing import normalize
 
         try:
-            vectorizer = TfidfVectorizer(max_features=384, stop_words="english")
-            matrix = vectorizer.fit_transform(texts)
+            if self._tfidf_vectorizer is None:
+                self._tfidf_vectorizer = TfidfVectorizer(max_features=384, stop_words="english")
+                matrix = self._tfidf_vectorizer.fit_transform(texts)
+            else:
+                try:
+                    matrix = self._tfidf_vectorizer.transform(texts)
+                except ValueError:
+                    # Vocabulary mismatch (e.g. empty) — refit
+                    self._tfidf_vectorizer = TfidfVectorizer(max_features=384, stop_words="english")
+                    matrix = self._tfidf_vectorizer.fit_transform(texts)
             dense = matrix.toarray().astype(np.float32)
-            return normalize(dense, norm="l2", axis=1)
+            # Pad/truncate to 384 dims for API consistency
+            if dense.shape[1] < 384:
+                dense = np.pad(dense, ((0, 0), (0, 384 - dense.shape[1])))
+            elif dense.shape[1] > 384:
+                dense = dense[:, :384]
+            norms = np.linalg.norm(dense, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            return (dense / norms).astype(np.float32)
         except Exception as exc:
             logger.error("[SemanticMatcher] TF-IDF fallback failed: %s", exc)
             return np.zeros((len(texts), 384), dtype=np.float32)
+
+    def reset_fallback(self) -> None:
+        """Clear the persistent TF-IDF vocabulary (fit fresh on next encode)."""
+        self._tfidf_vectorizer = None
 
     def compute_similarity(
         self,

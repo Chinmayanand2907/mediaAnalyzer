@@ -3,6 +3,7 @@ import {
   Search, Link as LinkIcon,
   Clock, Scale, MessageSquare, Sparkles, TrendingUp,
   Video, Layers, Eye, ThumbsUp, ExternalLink, Share2, X, CheckCircle2,
+  Zap,
 } from 'lucide-react';
 
 import { useAnalytics } from '../hooks/useAnalytics';
@@ -21,8 +22,15 @@ import SharedVideosTable   from '../components/tables/SharedVideosTable';
 
 const PRESET_SUBREDDITS = ['gaming', 'askreddit', 'gtaonline', 'technology', 'python'];
 
+function normalizeRedditUrl(permalink) {
+  if (!permalink) return null;
+  if (/^https?:\/\//i.test(permalink)) return permalink;
+  return `https://reddit.com${permalink.startsWith('/') ? '' : '/'}${permalink}`;
+}
+
 function fmt(n) {
-  if (n == null || n === 0) return '0';
+  if (n == null) return '—';
+  if (n === 0) return '0';
   if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
@@ -36,6 +44,9 @@ export default function CrossPlatformView() {
   // ── YouTube Video search / selection state ────────────────────────────
   const [videoQuery, setVideoQuery] = useState('');
   const [activeVideo, setActiveVideo] = useState('');
+
+  // ── P1: Unified search mode tab ───────────────────────────────────────
+  const [mode, setMode] = useState('video'); // 'video' | 'subreddit'
 
   // ── Tracked subreddits for quick-select chips ─────────────────────────
   const { data: subreddits } = useAnalytics(
@@ -82,7 +93,7 @@ export default function CrossPlatformView() {
   const effectiveSentiment = useMemo(() => {
     if (activeVideo && videoEngagement && (videoEngagement.youtube_sentiment || videoEngagement.reddit_sentiment)) {
       const yt = videoEngagement.youtube_sentiment || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
-      const rd = videoEngagement.reddit_sentiment || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
+      const rd = videoEngagement.reddit_sentiment  || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
       const gap = Number(((yt.positive || 0) - (rd.positive || 0)).toFixed(3));
       return {
         youtube_sentiment: yt,
@@ -156,7 +167,6 @@ export default function CrossPlatformView() {
   }, [videoEngagement, shared, activeSub]);
 
   // ── Computed KPI Values ────────────────────────────────────────────────
-  // 1. Subreddits Discussing count (how many subreddits our video is discussed in)
   const subredditsDiscussingCount = currentVideoData
     ? currentVideoData.subreddits_count
     : (shared?.length ? 1 : 0);
@@ -165,7 +175,6 @@ export default function CrossPlatformView() {
     ? `r/${currentVideoData.subreddits_list.slice(0, 3).join(', r/')}${currentVideoData.subreddits_list.length > 3 ? ` +${currentVideoData.subreddits_list.length - 3} more` : ''}`
     : `Found in r/${activeSub}`;
 
-  // 2. Reddit Discussions citing the video
   const totalRedditDiscussions = currentVideoData
     ? currentVideoData.total_reddit_discussions
     : (shared
@@ -176,20 +185,33 @@ export default function CrossPlatformView() {
     ? `${fmt(currentVideoData.reddit_total_upvotes)} total upvotes across Reddit`
     : 'Comments citing this video';
 
-  // 3. Video Views & Likes (Engagement of that video)
-  const videoViewsValue = currentVideoData?.youtube_views != null
-    ? fmt(currentVideoData.youtube_views)
-    : (summaryData?.correlation_summary?.avg_propagation_lag_hours
-        ? `${summaryData.correlation_summary.avg_propagation_lag_hours.toFixed(1)} hrs`
-        : '< 6 hrs');
+  // P2: Separate YouTube Reach (card 3) and Viral Latency (card 4) — always visible
+  const hasVideoViews = currentVideoData?.youtube_views != null;
 
-  const videoEngagementSub = currentVideoData?.youtube_likes != null
-    ? `${fmt(currentVideoData.youtube_likes)} likes • ${currentVideoData.propagation_speed || 'Active'}`
-    : 'YouTube video engagement';
+  // Card 3 — YouTube Reach
+  const card3Value = hasVideoViews ? fmt(currentVideoData.youtube_views) : '—';
+  const card3Sub   = hasVideoViews
+    ? `${fmt(currentVideoData.youtube_likes)} likes · ${currentVideoData.propagation_speed || 'Active'}`
+    : 'Select a video above to see reach';
+
+  // Card 4 — Viral Latency
+  const rawPropHours = currentVideoData?.propagation_delay_hours
+    ?? summaryData?.correlation_summary?.avg_propagation_lag_hours;
+  const card4Value = rawPropHours != null
+    ? `${Number(rawPropHours).toFixed(rawPropHours < 10 ? 1 : 0)} hrs`
+    : '—';
+  const card4Sub = currentVideoData?.propagation_delay_hours != null
+    ? 'YouTube → Reddit for this video'
+    : rawPropHours != null
+      ? 'Avg across all tracked videos'
+      : 'No propagation data yet';
 
   const availableSubs = subreddits?.length > 0
     ? Array.from(new Set([...subreddits.map(s => s.subreddit_name), ...PRESET_SUBREDDITS]))
     : PRESET_SUBREDDITS;
+
+  // DB subreddits set for live-dot indicator
+  const dbSubSet = new Set(subreddits?.map(s => s.subreddit_name) || []);
 
   return (
     <div className="fade-up" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
@@ -215,147 +237,349 @@ export default function CrossPlatformView() {
         </p>
       </div>
 
-      {/* ── YouTube Video Input & Analyzer Bar ──────────────────────────── */}
-      <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(6,182,212,0.25)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Video size={16} color="var(--cx-primary)" />
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-              Analyze a YouTube Video across Reddit
-            </h3>
-          </div>
-          {activeVideo && (
-            <button
-              onClick={handleClearVideo}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 4,
-                padding: '3px 8px', borderRadius: 6,
-                background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)',
-                color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-              }}
-            >
-              <X size={12} /> Clear video filter
-            </button>
-          )}
-        </div>
+      {/* ── P1: Unified Tabbed Search Control ───────────────────────────── */}
+      <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(6,182,212,0.2)' }}>
 
-        <form onSubmit={handleVideoSearch} style={{ display: 'flex', gap: 10, maxWidth: 640, marginBottom: 12 }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <input
-              type="text"
-              placeholder="Paste YouTube video URL or ID (e.g. https://youtu.be/dQw4w9WgXcQ or dQw4w9WgXcQ)…"
-              value={videoQuery}
-              onChange={(e) => setVideoQuery(e.target.value)}
-              style={{
-                width: '100%',
-                background: 'rgba(255,255,255,0.04)',
-                border: '1px solid var(--border-strong)',
-                borderRadius: 8,
-                padding: '9px 12px 9px 14px',
-                color: 'var(--text-primary)',
-                fontSize: 13,
-                outline: 'none',
-              }}
-              onFocus={(e) => e.target.style.borderColor = 'var(--cx-primary)'}
-              onBlur={(e) => e.target.style.borderColor = 'var(--border-strong)'}
-            />
-          </div>
+        {/* Tab bar */}
+        <div style={{
+          display: 'flex', gap: 4, marginBottom: 18,
+          background: 'rgba(255,255,255,0.04)',
+          borderRadius: 10, padding: 4,
+        }}>
           <button
-            type="submit"
+            onClick={() => setMode('video')}
             style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              background: 'linear-gradient(135deg, var(--cx-primary), #3b82f6)',
-              color: '#000', fontWeight: 700, fontSize: 13,
-              padding: '0 20px', borderRadius: 8,
-              border: 'none', cursor: 'pointer',
-              whiteSpace: 'nowrap',
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              padding: '9px 16px', borderRadius: 8, border: 'none', cursor: 'pointer',
+              fontWeight: 700, fontSize: 13,
+              transition: 'all 0.2s ease',
+              background: mode === 'video'
+                ? 'linear-gradient(135deg, rgba(6,182,212,0.22), rgba(99,102,241,0.18))'
+                : 'transparent',
+              color: mode === 'video' ? 'var(--cx-primary)' : 'var(--text-muted)',
+              boxShadow: mode === 'video' ? '0 2px 14px rgba(6,182,212,0.15)' : 'none',
+            }}
+          >
+            <Video size={14} />
+            Analyze a Video
+          </button>
+          <button
+            onClick={() => setMode('subreddit')}
+            style={{
+              flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+              padding: '9px 16px', borderRadius: 8, border: 'none', cursor: 'pointer',
+              fontWeight: 700, fontSize: 13,
+              transition: 'all 0.2s ease',
+              background: mode === 'subreddit'
+                ? 'linear-gradient(135deg, rgba(244,63,94,0.18), rgba(251,146,60,0.12))'
+                : 'transparent',
+              color: mode === 'subreddit' ? 'var(--rd-primary)' : 'var(--text-muted)',
+              boxShadow: mode === 'subreddit' ? '0 2px 14px rgba(244,63,94,0.12)' : 'none',
             }}
           >
             <Search size={14} />
-            Analyze Video
+            Explore Subreddits
           </button>
-        </form>
+        </div>
 
-        {/* Quick select video suggestions from current subreddit / shared videos */}
-        {shared && shared.length > 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
-            <span style={{ color: 'var(--text-muted)', fontWeight: 600 }}>Detected in DB:</span>
-            {shared.slice(0, 3).map((v) => (
-              <button
-                key={v.youtube_video_id}
-                onClick={() => handleVideoSelect(v)}
-                style={{
-                  padding: '3px 9px', borderRadius: 12,
-                  background: activeVideo === v.youtube_video_id ? 'rgba(6,182,212,0.25)' : 'rgba(255,255,255,0.05)',
-                  border: `1px solid ${activeVideo === v.youtube_video_id ? 'var(--cx-primary)' : 'var(--border)'}`,
-                  color: activeVideo === v.youtube_video_id ? 'var(--cx-primary)' : 'var(--text-secondary)',
-                  fontSize: 11, cursor: 'pointer', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-                }}
-                title={v.youtube_title || v.youtube_video_id}
-              >
-                ▶ {v.youtube_title || v.youtube_video_id}
-              </button>
-            ))}
+        {/* ── Video Analysis Mode ── */}
+        {mode === 'video' && (
+          <div>
+            {/* P2: Two-column layout — form left, hints right (collapses when video active) */}
+            <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
+
+              {/* Left: input + chips */}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    Paste a YouTube URL or video ID to see where it's being discussed on Reddit
+                  </p>
+                  {activeVideo && (
+                    <button
+                      onClick={handleClearVideo}
+                      style={{
+                        display: 'flex', alignItems: 'center', gap: 4,
+                        padding: '3px 8px', borderRadius: 6,
+                        background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)',
+                        color: '#ef4444', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      }}
+                    >
+                      <X size={12} /> Clear filter
+                    </button>
+                  )}
+                </div>
+
+                <form onSubmit={handleVideoSearch} style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+                  <div style={{ position: 'relative', flex: 1 }}>
+                    <input
+                      type="text"
+                      placeholder="e.g. https://youtu.be/dQw4w9WgXcQ  or  dQw4w9WgXcQ"
+                      value={videoQuery}
+                      onChange={(e) => setVideoQuery(e.target.value)}
+                      style={{
+                        width: '100%',
+                        background: 'rgba(255,255,255,0.04)',
+                        border: '1px solid var(--border-strong)',
+                        borderRadius: 8,
+                        padding: '9px 12px 9px 14px',
+                        color: 'var(--text-primary)',
+                        fontSize: 13,
+                        outline: 'none',
+                      }}
+                      onFocus={(e) => e.target.style.borderColor = 'var(--cx-primary)'}
+                      onBlur={(e) => e.target.style.borderColor  = 'var(--border-strong)'}
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 6,
+                      background: 'linear-gradient(135deg, var(--cx-primary), #3b82f6)',
+                      color: '#000', fontWeight: 700, fontSize: 13,
+                      padding: '0 20px', borderRadius: 8,
+                      border: 'none', cursor: 'pointer',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    <Search size={14} />
+                    Analyze Video
+                  </button>
+                </form>
+
+                {/* Recently tracked chips */}
+                {shared && shared.length > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
+                    <span style={{ color: 'var(--text-muted)', fontWeight: 600 }}>Recently tracked:</span>
+                    {shared.slice(0, 3).map((v) => (
+                      <button
+                        key={v.youtube_video_id}
+                        onClick={() => handleVideoSelect(v)}
+                        style={{
+                          padding: '3px 9px', borderRadius: 12,
+                          background: activeVideo === v.youtube_video_id ? 'rgba(6,182,212,0.25)' : 'rgba(255,255,255,0.05)',
+                          border: `1px solid ${activeVideo === v.youtube_video_id ? 'var(--cx-primary)' : 'var(--border)'}`,
+                          color: activeVideo === v.youtube_video_id ? 'var(--cx-primary)' : 'var(--text-secondary)',
+                          fontSize: 11, cursor: 'pointer', maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}
+                        title={v.youtube_title || v.youtube_video_id}
+                      >
+                        ▶ {v.youtube_title || v.youtube_video_id}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* P2: Right hint panel — only shown when no active video analysis */}
+              {!activeVideo && (
+                <div style={{
+                  flexShrink: 0, width: 220,
+                  padding: '14px 16px',
+                  borderRadius: 10,
+                  background: 'rgba(6,182,212,0.04)',
+                  border: '1px dashed rgba(6,182,212,0.2)',
+                  display: 'flex', flexDirection: 'column', gap: 10,
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--cx-primary)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>
+                    What you'll discover
+                  </div>
+                  {[
+                    { icon: Layers,       label: 'Which subreddits are sharing it' },
+                    { icon: MessageSquare,label: 'Reddit discussion threads' },
+                    { icon: Scale,        label: 'YouTube vs Reddit sentiment gap' },
+                    { icon: Zap,          label: 'Viral propagation speed' },
+                    { icon: ThumbsUp,     label: 'Total upvotes & engagement' },
+                  ].map(({ icon: Icon, label }) => (
+                    <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <div style={{
+                        width: 24, height: 24, borderRadius: 6, flexShrink: 0,
+                        background: 'rgba(6,182,212,0.12)',
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        <Icon size={12} color="var(--cx-primary)" />
+                      </div>
+                      <span style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.4 }}>{label}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Active Analyzed Video Detail Banner — full width below the two cols */}
+            {currentVideoData && (
+              <div style={{
+                marginTop: 14,
+                padding: 12,
+                borderRadius: 10,
+                background: 'rgba(6,182,212,0.06)',
+                border: '1px solid rgba(6,182,212,0.2)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                flexWrap: 'wrap',
+                gap: 12,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: 1 }}>
+                  {currentVideoData.youtube_thumbnail_url && (
+                    <img
+                      src={currentVideoData.youtube_thumbnail_url}
+                      alt=""
+                      style={{ width: 96, height: 54, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }}
+                    />
+                  )}
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {currentVideoData.youtube_title || currentVideoData.youtube_video_id}
+                      </span>
+                      {currentVideoData.youtube_url && (
+                        <a
+                          href={currentVideoData.youtube_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ color: 'var(--cx-primary)', display: 'inline-flex', alignItems: 'center' }}
+                          title="Open on YouTube"
+                        >
+                          <ExternalLink size={12} />
+                        </a>
+                      )}
+                      {activeVideo && (
+                        <span style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 5,
+                          fontSize: 10, fontWeight: 800,
+                          padding: '2px 8px', borderRadius: 10,
+                          background: 'rgba(34,197,94,0.15)',
+                          border: '1px solid rgba(34,197,94,0.3)',
+                          color: '#22c55e',
+                        }}>
+                          <span style={{
+                            width: 6, height: 6, borderRadius: '50%',
+                            background: '#22c55e',
+                            boxShadow: '0 0 6px #22c55e',
+                            animation: 'pulse 1.8s ease-in-out infinite',
+                          }} />
+                          LIVE ANALYSIS
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      {currentVideoData.youtube_channel_title && (
+                        <span>By <strong>{currentVideoData.youtube_channel_title}</strong></span>
+                      )}
+                      <span>• {fmt(currentVideoData.youtube_views)} views</span>
+                      <span>• {fmt(currentVideoData.youtube_likes)} likes</span>
+                      {currentVideoData.subreddits_list?.length > 0 && (
+                        <span>• <strong style={{ color: 'var(--cx-primary)' }}>
+                          Found in {currentVideoData.subreddits_list.length} subreddit{currentVideoData.subreddits_list.length !== 1 ? 's' : ''}
+                        </strong></span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
-        {/* Active Analyzed Video Detail Banner */}
-        {currentVideoData && (
-          <div style={{
-            marginTop: 14,
-            padding: 12,
-            borderRadius: 10,
-            background: 'rgba(6,182,212,0.06)',
-            border: '1px solid rgba(6,182,212,0.2)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            flexWrap: 'wrap',
-            gap: 12,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: 1 }}>
-              {currentVideoData.youtube_thumbnail_url && (
-                <img
-                  src={currentVideoData.youtube_thumbnail_url}
-                  alt=""
-                  style={{ width: 64, height: 38, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }}
-                />
-              )}
-              <div style={{ minWidth: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                    {currentVideoData.youtube_title || currentVideoData.youtube_video_id}
-                  </span>
-                  {currentVideoData.youtube_url && (
-                    <a
-                      href={currentVideoData.youtube_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{ color: 'var(--cx-primary)', display: 'inline-flex', alignItems: 'center' }}
-                      title="Open on YouTube"
-                    >
-                      <ExternalLink size={12} />
-                    </a>
-                  )}
-                </div>
-                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                  {currentVideoData.youtube_channel_title && (
-                    <span>By <strong>{currentVideoData.youtube_channel_title}</strong></span>
-                  )}
-                  <span>• {fmt(currentVideoData.youtube_views)} views</span>
-                  <span>• {fmt(currentVideoData.youtube_likes)} likes</span>
-                  {currentVideoData.subreddits_list?.length > 0 && (
-                    <span>• Discussed in: <strong style={{ color: 'var(--cx-primary)' }}>r/{currentVideoData.subreddits_list.join(', r/')}</strong></span>
-                  )}
-                </div>
+        {/* ── Subreddit Explore Mode ── */}
+        {mode === 'subreddit' && (
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Enter a subreddit to discover which YouTube videos its community is sharing and discussing
+              </p>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 5,
+                padding: '3px 10px', borderRadius: 16,
+                background: 'rgba(244,63,94,0.1)', border: '1px solid rgba(244,63,94,0.25)',
+                fontSize: 11, color: 'var(--rd-primary)', fontWeight: 600,
+              }}>
+                <Sparkles size={12} />
+                r/{activeSub}
               </div>
+            </div>
+
+            <form onSubmit={handleSubSearch} style={{ display: 'flex', gap: 10, maxWidth: 420, marginBottom: 12 }}>
+              <div style={{ position: 'relative', flex: 1 }}>
+                <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', fontWeight: 600, fontSize: 13 }}>
+                  r/
+                </span>
+                <input
+                  type="text"
+                  placeholder="gaming, askreddit, technology…"
+                  value={subQuery}
+                  onChange={(e) => setSubQuery(e.target.value)}
+                  style={{
+                    width: '100%',
+                    background: 'rgba(255,255,255,0.04)',
+                    border: '1px solid var(--border-strong)',
+                    borderRadius: 8,
+                    padding: '9px 12px 9px 30px',
+                    color: 'var(--text-primary)',
+                    fontSize: 13,
+                    outline: 'none',
+                  }}
+                  onFocus={(e) => e.target.style.borderColor = 'var(--rd-primary)'}
+                  onBlur={(e) => e.target.style.borderColor  = 'var(--border-strong)'}
+                />
+              </div>
+              <button
+                type="submit"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6,
+                  background: 'var(--rd-primary)',
+                  color: '#fff', fontWeight: 700, fontSize: 13,
+                  padding: '0 18px', borderRadius: 8,
+                  border: 'none', cursor: 'pointer',
+                }}
+              >
+                <Search size={14} />
+                Scan
+              </button>
+            </form>
+
+            {/* Subreddit chips with live indicator */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+              {availableSubs.map((sub) => {
+                const isActive = activeSub === sub;
+                const isLive   = dbSubSet.has(sub);
+                return (
+                  <button
+                    key={sub}
+                    onClick={() => handleSubChipClick(sub)}
+                    style={{
+                      padding: '4px 10px', borderRadius: 14,
+                      background: isActive
+                        ? 'linear-gradient(135deg, rgba(244,63,94,0.3), rgba(251,146,60,0.2))'
+                        : 'rgba(255,255,255,0.05)',
+                      border: `1px solid ${isActive ? 'var(--rd-primary)' : 'var(--border)'}`,
+                      color: isActive ? 'var(--rd-primary)' : 'var(--text-secondary)',
+                      fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      boxShadow: isActive ? '0 0 12px rgba(244,63,94,0.2)' : 'none',
+                      transition: 'all 0.15s ease',
+                      display: 'flex', alignItems: 'center', gap: 5,
+                    }}
+                    onMouseEnter={(e) => !isActive && (e.currentTarget.style.borderColor = 'var(--border-strong)')}
+                    onMouseLeave={(e) => !isActive && (e.currentTarget.style.borderColor = 'var(--border)')}
+                  >
+                    {isLive && (
+                      <span style={{
+                        width: 5, height: 5, borderRadius: '50%',
+                        background: isActive ? 'var(--rd-primary)' : '#22c55e',
+                        flexShrink: 0,
+                      }} />
+                    )}
+                    r/{sub}
+                  </button>
+                );
+              })}
             </div>
           </div>
         )}
       </div>
 
-      {/* ── Updated KPI Cards ───────────────────────────────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+      {/* ── P2: 4-card KPI Grid — YouTube Reach + Viral Latency always visible ── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
         <StatCard
           title="Subreddits Discussing"
           value={subredditsDiscussingCount}
@@ -373,11 +597,19 @@ export default function CrossPlatformView() {
           loading={sharedLoading || videoLoading}
         />
         <StatCard
-          title="Video Views & Likes"
-          value={videoViewsValue}
-          sub={videoEngagementSub}
+          title="YouTube Reach"
+          value={card3Value}
+          sub={card3Sub}
           icon={Eye}
           accent="#f59e0b"
+          loading={sharedLoading || videoLoading}
+        />
+        <StatCard
+          title="Viral Latency"
+          value={card4Value}
+          sub={card4Sub}
+          icon={Zap}
+          accent="#a78bfa"
           loading={sharedLoading || videoLoading || summaryLoading}
         />
       </div>
@@ -428,7 +660,7 @@ export default function CrossPlatformView() {
                   </div>
                   {d.permalink && (
                     <a
-                      href={d.permalink}
+                      href={normalizeRedditUrl(d.permalink)}
                       target="_blank"
                       rel="noopener noreferrer"
                       style={{ color: 'var(--cx-primary)', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4 }}
@@ -446,88 +678,13 @@ export default function CrossPlatformView() {
         </div>
       )}
 
-      {/* ── Subreddit Scanner ───────────────────────────────────────────── */}
-      <div className="glass-card" style={{ padding: 20 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-            Scan a Subreddit
-          </h3>
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 5,
-            padding: '3px 10px', borderRadius: 16,
-            background: 'rgba(6,182,212,0.1)', border: '1px solid rgba(6,182,212,0.25)',
-            fontSize: 11, color: 'var(--cx-primary)', fontWeight: 600,
-          }}>
-            <Sparkles size={12} />
-            r/{activeSub}
-          </div>
-        </div>
-
-        <form onSubmit={handleSubSearch} style={{ display: 'flex', gap: 10, maxWidth: 420, marginBottom: 10 }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-muted)', fontWeight: 600, fontSize: 13 }}>
-              r/
-            </span>
-            <input
-              type="text"
-              placeholder="gaming, askreddit, technology…"
-              value={subQuery}
-              onChange={(e) => setSubQuery(e.target.value)}
-              style={{
-                width: '100%',
-                background: 'rgba(255,255,255,0.04)',
-                border: '1px solid var(--border-strong)',
-                borderRadius: 8,
-                padding: '9px 12px 9px 30px',
-                color: 'var(--text-primary)',
-                fontSize: 13,
-                outline: 'none',
-              }}
-              onFocus={(e) => e.target.style.borderColor = 'var(--cx-primary)'}
-              onBlur={(e) => e.target.style.borderColor = 'var(--border-strong)'}
-            />
-          </div>
-          <button
-            type="submit"
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6,
-              background: 'var(--cx-primary)',
-              color: '#000', fontWeight: 700, fontSize: 13,
-              padding: '0 18px', borderRadius: 8,
-              border: 'none', cursor: 'pointer',
-            }}
-          >
-            <Search size={14} />
-            Scan
-          </button>
-        </form>
-
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-          {availableSubs.map((sub) => (
-            <button
-              key={sub}
-              onClick={() => handleSubChipClick(sub)}
-              style={{
-                padding: '3px 10px', borderRadius: 14,
-                background: activeSub === sub ? 'rgba(6,182,212,0.25)' : 'rgba(255,255,255,0.05)',
-                border: `1px solid ${activeSub === sub ? 'var(--cx-primary)' : 'var(--border)'}`,
-                color: activeSub === sub ? 'var(--cx-primary)' : 'var(--text-secondary)',
-                fontSize: 11, fontWeight: 600, cursor: 'pointer',
-              }}
-            >
-              r/{sub}
-            </button>
-          ))}
-        </div>
-      </div>
-
       {/* ── Shared Videos Table (with expandable discussion drawer) ────── */}
       <div className="glass-card" style={{ padding: 20 }}>
         <div style={{ marginBottom: 14 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--rd-primary)', paddingLeft: 10 }}>
             YouTube Videos Shared in r/{activeSub}
           </h3>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
             Click the discussion button on any row to see the Reddit comments that linked the video.
           </p>
         </div>
@@ -543,10 +700,10 @@ export default function CrossPlatformView() {
       {/* ── Sentiment Comparison ─────────────────────────────────────────── */}
       <div className="glass-card" style={{ padding: 20 }}>
         <div style={{ marginBottom: 14 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
             Audience Sentiment: YouTube vs Reddit
           </h3>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
             How audience reaction on YouTube differs from the Reddit discussion for the same content.
           </p>
         </div>
@@ -558,11 +715,11 @@ export default function CrossPlatformView() {
         <div style={{ marginBottom: 14 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <TrendingUp size={18} color="var(--cx-primary)" />
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
               Top YouTube Videos for "{activeSub}"
             </h3>
           </div>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
             Most viewed YouTube videos related to this subreddit topic, fetched live from YouTube.
           </p>
         </div>
@@ -578,4 +735,3 @@ export default function CrossPlatformView() {
     </div>
   );
 }
-

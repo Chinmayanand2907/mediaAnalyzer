@@ -148,29 +148,41 @@ export default function ChatBotPanel({ platform }) {
     setError('');
     setMessages((prev) => [...prev, { role: 'user', content: question }]);
     setLoading(true);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const res = await fetch('/api/v1/chatbot/query', {
+      const base = import.meta.env.VITE_API_BASE || '';
+      const res = await fetch(`${base}/api/v1/chatbot/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           question,
           context: platform,
-          // Send last 6 turns as history for multi-turn context
+          // Last 6 messages (≈3 turns) for multi-turn context
           history: messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
         }),
       });
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || `Server error ${res.status}`);
+        const detail = Array.isArray(data.detail)
+          ? data.detail.map((d) => d.msg || JSON.stringify(d)).join('; ')
+          : data.detail;
+        throw new Error(detail || `Server error ${res.status}`);
       }
 
       const data = await res.json();
       setMessages((prev) => [...prev, { role: 'assistant', content: data.answer }]);
     } catch (err) {
-      setError(err.message || 'Failed to reach the chatbot. Is the backend running?');
+      if (err?.name === 'AbortError') {
+        setError('Chatbot timed out. Try a shorter question.');
+      } else {
+        setError(err.message || 'Failed to reach the chatbot. Is the backend running?');
+      }
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
     }
   };

@@ -27,8 +27,7 @@ from enum import Enum
 from typing import Optional, Dict, Any
 from pydantic import ConfigDict
 from sqlalchemy import Column, JSON
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import UniqueConstraint
 from sqlmodel import Field, SQLModel
 
@@ -48,7 +47,7 @@ async_engine = create_async_engine(
 )
 
 # ─── Session Factory ─────────────────────────────────────────────
-AsyncSessionLocal = sessionmaker(
+AsyncSessionLocal = async_sessionmaker(
     bind=async_engine,
     class_=AsyncSession,
     expire_on_commit=False,
@@ -60,14 +59,20 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """Yield an async session per request; auto-closes on exit.
 
     Inject into any route with ``Depends(get_db_session)``.
+    Endpoints commit explicitly when they write; read-only routes
+    do no commit (avoids opening write txns for GETs).
     """
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
+
+
+async def dispose_engine() -> None:
+    """Dispose the async engine pool (call on app shutdown / tests)."""
+    await async_engine.dispose()
 
 
 # ─── Startup Initializer ────────────────────────────────────────
