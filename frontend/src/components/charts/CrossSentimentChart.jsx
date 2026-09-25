@@ -110,35 +110,42 @@ export default function CrossSentimentChart({ data, loading }) {
               Audience Response Contrast
             </span>
 
-            {/* P1: Sentiment gap badge (original) */}
-            {hasData && (
+            {/* Sentiment gap badge — only when both platforms have sampled comments */}
+            {yt.sample_size > 0 && rd.sample_size > 0 ? (
+              <>
+                <span style={{
+                  fontSize: 11, fontWeight: 800,
+                  padding: '2px 8px', borderRadius: 12,
+                  background: gap > 0 ? 'rgba(99,102,241,0.18)' : gap < 0 ? 'rgba(244,63,94,0.18)' : 'rgba(255,255,255,0.08)',
+                  color:      gap > 0 ? 'var(--yt-primary)'     : gap < 0 ? 'var(--rd-primary)'     : 'var(--text-secondary)',
+                }}>
+                  {gap > 0
+                    ? `+${(gap * 100).toFixed(0)}% YouTube Positive Lead`
+                    : gap < 0
+                    ? `+${(absGap * 100).toFixed(0)}% Reddit Sentiment Lead`
+                    : '0% Sentiment Gap'}
+                </span>
+                <span style={{
+                  fontSize: 11, fontWeight: 800,
+                  padding: '2px 10px', borderRadius: 12,
+                  background: divergence.bg,
+                  border: `1px solid ${divergence.border}`,
+                  color: divergence.color,
+                  letterSpacing: '0.02em',
+                }}>
+                  {divergence.label}
+                </span>
+              </>
+            ) : hasData ? (
               <span style={{
                 fontSize: 11, fontWeight: 800,
                 padding: '2px 8px', borderRadius: 12,
-                background: gap > 0 ? 'rgba(99,102,241,0.18)' : gap < 0 ? 'rgba(244,63,94,0.18)' : 'rgba(255,255,255,0.08)',
-                color:      gap > 0 ? 'var(--yt-primary)'     : gap < 0 ? 'var(--rd-primary)'     : 'var(--text-secondary)',
+                background: 'rgba(6,182,212,0.15)',
+                color: 'var(--cx-primary)',
               }}>
-                {gap > 0
-                  ? `+${(gap * 100).toFixed(0)}% YouTube Positive Lead`
-                  : gap < 0
-                  ? `+${(absGap * 100).toFixed(0)}% Reddit Sentiment Lead`
-                  : '0% Sentiment Gap'}
+                {yt.sample_size > 0 ? `${yt.sample_size} YouTube Comments Analyzed` : `${rd.sample_size} Reddit Comments Analyzed`}
               </span>
-            )}
-
-            {/* P1: Divergence score badge */}
-            {hasData && (
-              <span style={{
-                fontSize: 11, fontWeight: 800,
-                padding: '2px 10px', borderRadius: 12,
-                background: divergence.bg,
-                border: `1px solid ${divergence.border}`,
-                color: divergence.color,
-                letterSpacing: '0.02em',
-              }}>
-                {divergence.label}
-              </span>
-            )}
+            ) : null}
           </div>
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
             {summary}
@@ -210,11 +217,20 @@ export default function CrossSentimentChart({ data, loading }) {
           padding: '12px 16px', borderRadius: 8,
           background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.2)',
         }}>
-          <div style={{ fontSize: 11, color: 'var(--yt-primary)', fontWeight: 600, marginBottom: 2 }}>YouTube Audience</div>
-          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)' }}>
-            {(yt.positive * 100).toFixed(0)}% Positive
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+            <span style={{ fontSize: 11, color: 'var(--yt-primary)', fontWeight: 600 }}>YouTube Audience</span>
+            {yt.sample_size > 0 && (
+              <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{yt.sample_size} comments</span>
+            )}
           </div>
-          <SentimentMiniBar positive={yt.positive} neutral={yt.neutral} negative={yt.negative} />
+          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)' }}>
+            {yt.sample_size > 0 ? `${(yt.positive * 100).toFixed(0)}% Positive` : 'No comments'}
+          </div>
+          {yt.sample_size > 0 ? (
+            <SentimentMiniBar positive={yt.positive} neutral={yt.neutral} negative={yt.negative} />
+          ) : (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>Awaiting comment scan</div>
+          )}
         </div>
 
         {/* Reddit */}
@@ -222,11 +238,20 @@ export default function CrossSentimentChart({ data, loading }) {
           padding: '12px 16px', borderRadius: 8,
           background: 'rgba(244,63,94,0.08)', border: '1px solid rgba(244,63,94,0.2)',
         }}>
-          <div style={{ fontSize: 11, color: 'var(--rd-primary)', fontWeight: 600, marginBottom: 2 }}>Reddit Community</div>
-          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)' }}>
-            {(rd.positive * 100).toFixed(0)}% Positive
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 2 }}>
+            <span style={{ fontSize: 11, color: 'var(--rd-primary)', fontWeight: 600 }}>Reddit Community</span>
+            {rd.sample_size > 0 && (
+              <span style={{ fontSize: 10, color: 'var(--text-muted)' }}>{rd.sample_size} comments</span>
+            )}
           </div>
-          <SentimentMiniBar positive={rd.positive} neutral={rd.neutral} negative={rd.negative} />
+          <div style={{ fontSize: 18, fontWeight: 800, color: 'var(--text-primary)' }}>
+            {rd.sample_size > 0 ? `${(rd.positive * 100).toFixed(0)}% Positive` : 'No comments found'}
+          </div>
+          {rd.sample_size > 0 ? (
+            <SentimentMiniBar positive={rd.positive} neutral={rd.neutral} negative={rd.negative} />
+          ) : (
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>No Reddit discussions found yet</div>
+          )}
         </div>
       </div>
     </div>

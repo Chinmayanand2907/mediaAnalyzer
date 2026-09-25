@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import {
   Search, Link as LinkIcon,
   Clock, Scale, MessageSquare, Sparkles, TrendingUp,
@@ -38,8 +38,8 @@ function fmt(n) {
 }
 
 export default function CrossPlatformView() {
-  const [subQuery, setSubQuery]     = useState('gaming');
-  const [activeSub, setActiveSub]   = useState('gaming');
+  const [subQuery, setSubQuery]     = useState('');
+  const [activeSub, setActiveSub]   = useState('');
 
   // ── YouTube Video search / selection state ────────────────────────────
   const [videoQuery, setVideoQuery] = useState('');
@@ -53,6 +53,24 @@ export default function CrossPlatformView() {
     (signal) => fetchRedditSubreddits(signal),
     []
   );
+
+  // ── Global "Recently Tracked" videos — all DB-tracked videos, no subreddit filter ──
+  // Fetches the 50 most recently ingested tracked videos globally (backend sorts by ingested_at desc).
+  // Used to fill the "Recently tracked" chips when session history is sparse.
+  const { data: globalTracked } = useAnalytics(
+    (signal) => fetchSharedVideos(null, 50, signal),
+    [],
+    { cacheKey: 'global:recently-tracked' }
+  );
+
+  // ── Session-analyzed videos: persisted in localStorage ───────────────
+  // Every time the user successfully analyzes a video (videoEngagement resolves),
+  // we record it so the chips reflect what *this user* has actually analyzed.
+  const [sessionVideos, setSessionVideos] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('cx_recently_analyzed') || '[]');
+    } catch { return []; }
+  });
 
   // ── Correlation Summary ───────────────────────────────────────────────
   const { data: summaryData, loading: summaryLoading } = useAnalytics(
@@ -68,11 +86,15 @@ export default function CrossPlatformView() {
     { enabled: !!activeSub }
   );
 
-  // ── Sentiment Comparison ──────────────────────────────────────────────
+  // ── Sentiment Comparison (video-aware) ─────────────────────────────────
+  // When a video is being analyzed, scope sentiment to that video across ALL
+  // subreddits (matching the video-wide KPIs/discussions above) — never
+  // silently show subreddit-wide data as video data.
+  const sentimentSub = activeVideo ? null : activeSub;
   const { data: sentimentComp, loading: sentLoading } = useAnalytics(
-    (signal) => fetchCrossPlatformSentiment(activeSub, signal),
-    [activeSub],
-    { enabled: !!activeSub }
+    (signal) => fetchCrossPlatformSentiment(sentimentSub, signal, activeVideo || null),
+    [sentimentSub, activeVideo],
+    { enabled: !!activeSub || !!activeVideo, cacheKey: `sentiment:${sentimentSub || 'all'}:${activeVideo || 'sub'}` }
   );
 
   // ── Top YouTube Videos for the subreddit topic ────────────────────────
@@ -89,27 +111,85 @@ export default function CrossPlatformView() {
     { enabled: !!activeVideo }
   );
 
+  // ── Record each successfully analyzed video into session + localStorage ──
+  useEffect(() => {
+    if (!videoEngagement || !activeVideo) return;
+    const entry = {
+      youtube_video_id: videoEngagement.youtube_video_id || activeVideo,
+      youtube_title: videoEngagement.youtube_title || activeVideo,
+      youtube_url: videoEngagement.youtube_url || null,
+    };
+    setSessionVideos((prev) => {
+      const filtered = prev.filter(
+        (v) => v.youtube_video_id !== entry.youtube_video_id
+      );
+      const next = [entry, ...filtered].slice(0, 5);
+      try { localStorage.setItem('cx_recently_analyzed', JSON.stringify(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, [videoEngagement, activeVideo]);
+
+  // Merged chip list: session-analyzed first, then global DB videos, de-duplicated
+  const recentlyTrackedChips = useMemo(() => {
+    const sessionIds = new Set(sessionVideos.map((v) => v.youtube_video_id));
+    const dbExtras = (globalTracked || []).filter(
+      (v) => !sessionIds.has(v.youtube_video_id)
+    );
+    return [...sessionVideos, ...dbExtras].slice(0, 5);
+  }, [sessionVideos, globalTracked]);
+
   // ── Dynamic Effective Sentiment (Video-specific or Subreddit-specific) ──
+  // Integrity rule: when activeVideo is set, NEVER fall back to subreddit-wide
+  // sentiment. Show video-scoped data (videoEngagement first, then the
+  // video-filtered sentiment-comparison), or an explicit empty state.
+  const sampleSize = (s) => Number(s?.sample_size || 0);
+  const hasSamples = (s) => sampleSize(s?.youtube_sentiment) > 0 || sampleSize(s?.reddit_sentiment) > 0;
+
   const effectiveSentiment = useMemo(() => {
-    if (activeVideo && videoEngagement && (videoEngagement.youtube_sentiment || videoEngagement.reddit_sentiment)) {
-      const yt = videoEngagement.youtube_sentiment || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
-      const rd = videoEngagement.reddit_sentiment  || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
-      const gap = Number(((yt.positive || 0) - (rd.positive || 0)).toFixed(3));
+    if (activeVideo) {
+      const veYt = videoEngagement?.youtube_sentiment || null;
+      const veRd = videoEngagement?.reddit_sentiment || null;
+      if (videoEngagement && (sampleSize(veYt) > 0 || sampleSize(veRd) > 0)) {
+        const yt = veYt || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
+        const rd = veRd || { positive: 0, neutral: 0, negative: 0, sample_size: 0 };
+        const gap = Number(((yt.positive || 0) - (rd.positive || 0)).toFixed(3));
+        return {
+          youtube_sentiment: yt,
+          reddit_sentiment: rd,
+          sentiment_gap: gap,
+          audience_response_summary: videoEngagement.sentiment_disparity_note || (
+            gap > 0.1
+              ? `YouTube reception is notably more positive (${Math.round((yt.positive || 0) * 100)}%) than Reddit community discussion (${Math.round((rd.positive || 0) * 100)}%) for this video.`
+              : gap < -0.1
+              ? `Reddit discussion is more positive (${Math.round((rd.positive || 0) * 100)}%) than YouTube audience for this video.`
+              : `Audience response is closely aligned between YouTube and Reddit for this video.`
+          ),
+          _scope: 'video',
+          _videoId: activeVideo,
+        };
+      }
+      // Fall back to the video-filtered sentiment-comparison (same video scope).
+      if (sentimentComp && hasSamples(sentimentComp)) {
+        return { ...sentimentComp, _scope: 'video', _videoId: activeVideo };
+      }
+      // Explicit empty video scope — do NOT show subreddit data as video data.
       return {
-        youtube_sentiment: yt,
-        reddit_sentiment: rd,
-        sentiment_gap: gap,
-        audience_response_summary: videoEngagement.sentiment_disparity_note || (
-          gap > 0.1
-            ? `YouTube reception is notably more positive (${Math.round((yt.positive || 0) * 100)}%) than Reddit community discussion (${Math.round((rd.positive || 0) * 100)}%).`
-            : gap < -0.1
-            ? `Reddit discussion is more positive (${Math.round((rd.positive || 0) * 100)}%) than YouTube audience.`
-            : `Audience response is closely aligned between YouTube and Reddit community discussions.`
-        ),
+        youtube_sentiment: { positive: 0, neutral: 0, negative: 0, sample_size: 0 },
+        reddit_sentiment: { positive: 0, neutral: 0, negative: 0, sample_size: 0 },
+        sentiment_gap: 0,
+        audience_response_summary: 'No sentiment comments found for this video yet. Try a video with tracked discussions or ingest fresh data.',
+        _scope: 'video',
+        _videoId: activeVideo,
       };
     }
-    return sentimentComp;
+    return sentimentComp ? { ...sentimentComp, _scope: 'subreddit' } : sentimentComp;
   }, [activeVideo, videoEngagement, sentimentComp]);
+
+  const sentimentScope = effectiveSentiment?._scope || (activeVideo ? 'video' : 'subreddit');
+  const isVideoSentiment = sentimentScope === 'video';
+  const sentimentLoading = isVideoSentiment
+    ? (videoLoading || sentLoading)
+    : sentLoading;
 
   const handleSubSearch = (e) => {
     e.preventDefault();
@@ -141,30 +221,40 @@ export default function CrossPlatformView() {
     setActiveVideo('');
   };
 
-  // ── Video engagement fallback from active video or first shared video ──
+  // ── Video engagement data — only populated when user has submitted a video ID ──
+  // The shared[] fallback is intentionally removed: showing shared[0] when no
+  // video has been entered misleads the user with stale/unrelated DB data.
   const currentVideoData = useMemo(() => {
+    if (!activeVideo) return null;          // no input → nothing to show
     if (videoEngagement) return videoEngagement;
+    // activeVideo is set but videoEngagement hasn't resolved yet — find it in
+    // the already-fetched shared list so the banner is not blank while loading.
     if (shared && shared.length > 0) {
-      const top = shared[0];
-      return {
-        youtube_video_id: top.youtube_video_id,
-        youtube_url: top.youtube_url,
-        youtube_title: top.youtube_title,
-        youtube_channel_title: top.youtube_channel_title,
-        youtube_thumbnail_url: top.youtube_thumbnail_url,
-        youtube_views: top.youtube_views,
-        youtube_likes: top.youtube_likes,
-        youtube_comment_count: top.youtube_comment_count,
-        subreddits_count: top.reddit_subreddits?.length || (top.reddit_discussions?.length ? 1 : 0),
-        subreddits_list: top.reddit_subreddits || (activeSub ? [activeSub] : []),
-        total_reddit_discussions: top.reddit_discussions?.length || top.total_reddit_shares || 0,
-        reddit_total_upvotes: top.reddit_total_upvotes || 0,
-        propagation_delay_hours: top.propagation_delay_hours,
-        propagation_speed: top.propagation_speed,
-      };
+      const match = shared.find(
+        (v) => v.youtube_video_id === activeVideo ||
+               (v.youtube_url || '').includes(activeVideo)
+      );
+      if (match) {
+        return {
+          youtube_video_id: match.youtube_video_id,
+          youtube_url: match.youtube_url,
+          youtube_title: match.youtube_title,
+          youtube_channel_title: match.youtube_channel_title,
+          youtube_thumbnail_url: match.youtube_thumbnail_url,
+          youtube_views: match.youtube_views,
+          youtube_likes: match.youtube_likes,
+          youtube_comment_count: match.youtube_comment_count,
+          subreddits_count: match.reddit_subreddits?.length || (match.reddit_discussions?.length ? 1 : 0),
+          subreddits_list: match.reddit_subreddits || (activeSub ? [activeSub] : []),
+          total_reddit_discussions: match.reddit_discussions?.length || match.total_reddit_shares || 0,
+          reddit_total_upvotes: match.reddit_total_upvotes || 0,
+          propagation_delay_hours: match.propagation_delay_hours,
+          propagation_speed: match.propagation_speed,
+        };
+      }
     }
     return null;
-  }, [videoEngagement, shared, activeSub]);
+  }, [activeVideo, videoEngagement, shared, activeSub]);
 
   // ── Computed KPI Values ────────────────────────────────────────────────
   const subredditsDiscussingCount = currentVideoData
@@ -346,11 +436,11 @@ export default function CrossPlatformView() {
                   </button>
                 </form>
 
-                {/* Recently tracked chips */}
-                {shared && shared.length > 0 && (
+                {/* Recently tracked chips — accurate: session-analyzed + global DB videos */}
+                {recentlyTrackedChips.length > 0 && (
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', fontSize: 11 }}>
                     <span style={{ color: 'var(--text-muted)', fontWeight: 600 }}>Recently tracked:</span>
-                    {shared.slice(0, 3).map((v) => (
+                    {recentlyTrackedChips.map((v) => (
                       <button
                         key={v.youtube_video_id}
                         onClick={() => handleVideoSelect(v)}
@@ -405,8 +495,8 @@ export default function CrossPlatformView() {
               )}
             </div>
 
-            {/* Active Analyzed Video Detail Banner — full width below the two cols */}
-            {currentVideoData && (
+            {/* Active Analyzed Video Detail Banner — only when user has submitted a video ID */}
+            {activeVideo && currentVideoData && (
               <div style={{
                 marginTop: 14,
                 padding: 12,
@@ -488,15 +578,27 @@ export default function CrossPlatformView() {
               <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>
                 Enter a subreddit to discover which YouTube videos its community is sharing and discussing
               </p>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 5,
-                padding: '3px 10px', borderRadius: 16,
-                background: 'rgba(244,63,94,0.1)', border: '1px solid rgba(244,63,94,0.25)',
-                fontSize: 11, color: 'var(--rd-primary)', fontWeight: 600,
-              }}>
-                <Sparkles size={12} />
-                r/{activeSub}
-              </div>
+              {activeSub ? (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  padding: '3px 10px', borderRadius: 16,
+                  background: 'rgba(244,63,94,0.1)', border: '1px solid rgba(244,63,94,0.25)',
+                  fontSize: 11, color: 'var(--rd-primary)', fontWeight: 600,
+                }}>
+                  <Sparkles size={12} />
+                  r/{activeSub}
+                </div>
+              ) : (
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 5,
+                  padding: '3px 10px', borderRadius: 16,
+                  background: 'rgba(107,114,128,0.08)', border: '1px solid rgba(107,114,128,0.2)',
+                  fontSize: 11, color: 'var(--text-muted)', fontWeight: 600,
+                }}>
+                  <Search size={12} />
+                  No subreddit selected
+                </div>
+              )}
             </div>
 
             <form onSubmit={handleSubSearch} style={{ display: 'flex', gap: 10, maxWidth: 420, marginBottom: 12 }}>
@@ -574,163 +676,244 @@ export default function CrossPlatformView() {
                 );
               })}
             </div>
+
+            {/* Empty-state: prompt user to enter a subreddit */}
+            {!activeSub && (
+              <div style={{
+                marginTop: 20,
+                padding: '28px 20px',
+                borderRadius: 12,
+                background: 'rgba(244,63,94,0.04)',
+                border: '1px dashed rgba(244,63,94,0.2)',
+                textAlign: 'center',
+              }}>
+                <Search size={28} color="rgba(244,63,94,0.4)" style={{ marginBottom: 10 }} />
+                <p style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-secondary)', marginBottom: 6 }}>
+                  Enter a subreddit to begin
+                </p>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', maxWidth: 380, margin: '0 auto' }}>
+                  Type a subreddit name above and click <strong>Scan</strong>, or pick one of the quick-select chips to discover which YouTube videos its community is sharing.
+                </p>
+              </div>
+            )}
           </div>
         )}
       </div>
 
-      {/* ── P2: 4-card KPI Grid — YouTube Reach + Viral Latency always visible ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
-        <StatCard
-          title="Subreddits Discussing"
-          value={subredditsDiscussingCount}
-          sub={subredditsListText}
-          icon={Layers}
-          accent="var(--cx-primary)"
-          loading={sharedLoading || videoLoading}
-        />
-        <StatCard
-          title="Reddit Discussions"
-          value={totalRedditDiscussions}
-          sub={redditDiscussionsSub}
-          icon={MessageSquare}
-          accent="var(--rd-primary)"
-          loading={sharedLoading || videoLoading}
-        />
-        <StatCard
-          title="YouTube Reach"
-          value={card3Value}
-          sub={card3Sub}
-          icon={Eye}
-          accent="#f59e0b"
-          loading={sharedLoading || videoLoading}
-        />
-        <StatCard
-          title="Viral Latency"
-          value={card4Value}
-          sub={card4Sub}
-          icon={Zap}
-          accent="#a78bfa"
-          loading={sharedLoading || videoLoading || summaryLoading}
-        />
-      </div>
+      {/* ── P2: 4-card KPI Grid — only in Analyze a Video mode ── */}
+      {mode === 'video' && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
+          <StatCard
+            title="Subreddits Discussing"
+            value={activeVideo ? subredditsDiscussingCount : '—'}
+            sub={activeVideo ? subredditsListText : 'Enter a video ID or URL above'}
+            icon={Layers}
+            accent="var(--cx-primary)"
+            loading={videoLoading}
+          />
+          <StatCard
+            title="Reddit Discussions"
+            value={activeVideo ? totalRedditDiscussions : '—'}
+            sub={activeVideo ? redditDiscussionsSub : 'Enter a video ID or URL above'}
+            icon={MessageSquare}
+            accent="var(--rd-primary)"
+            loading={videoLoading}
+          />
+          <StatCard
+            title="YouTube Reach"
+            value={activeVideo ? card3Value : '—'}
+            sub={activeVideo ? card3Sub : 'Enter a video ID or URL above'}
+            icon={Eye}
+            accent="#f59e0b"
+            loading={videoLoading}
+          />
+          <StatCard
+            title="Viral Latency"
+            value={activeVideo ? card4Value : '—'}
+            sub={activeVideo ? card4Sub : 'Enter a video ID or URL above'}
+            icon={Zap}
+            accent="#a78bfa"
+            loading={videoLoading || summaryLoading}
+          />
+        </div>
+      )}
 
-      {/* ── Active Video Live Discussions Across All of Reddit ── */}
-      {activeVideo && videoEngagement && videoEngagement.discussions?.length > 0 && (
-        <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(6,182,212,0.25)' }}>
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <MessageSquare size={16} color="var(--rd-primary)" />
-              <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-                Reddit Discussions Found Across All Subreddits ({videoEngagement.discussions.length})
-              </h3>
+      {/* ── Active Video Live Discussions Across All of Reddit — only in Analyze a Video mode ── */}
+      {/* ── Active Video Live Discussions Across All of Reddit — only in Analyze a Video mode ── */}
+      {mode === 'video' && activeVideo && videoLoading && (
+        <div className="skeleton" style={{ height: 220, borderRadius: 12 }} />
+      )}
+
+      {mode === 'video' && activeVideo && !videoLoading && videoEngagement && (
+        videoEngagement.discussions?.length > 0 ? (
+          <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(6,182,212,0.25)' }}>
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <MessageSquare size={16} color="var(--rd-primary)" />
+                <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                  Reddit Discussions Found Across All Subreddits ({videoEngagement.discussions.length})
+                </h3>
+              </div>
+              <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                Discussions and comments referencing this video across communities:{' '}
+                <strong style={{ color: 'var(--cx-primary)' }}>
+                  {videoEngagement.subreddits_list?.map(s => `r/${s}`).join(', ') || 'Various Subreddits'}
+                </strong>
+              </p>
             </div>
-            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
-              Discussions and comments referencing this video across communities:{' '}
-              <strong style={{ color: 'var(--cx-primary)' }}>
-                {videoEngagement.subreddits_list.map(s => `r/${s}`).join(', ')}
-              </strong>
-            </p>
-          </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 380, overflowY: 'auto' }}>
-            {videoEngagement.discussions.map((d, i) => (
-              <div
-                key={d.discussion_id || i}
-                style={{
-                  padding: 12, borderRadius: 8,
-                  background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)',
-                  display: 'flex', flexDirection: 'column', gap: 6,
-                }}
-              >
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-                    <span style={{ padding: '2px 7px', borderRadius: 4, background: 'rgba(244,63,94,0.15)', color: 'var(--rd-primary)', fontWeight: 700, fontSize: 11 }}>
-                      r/{d.subreddit}
-                    </span>
-                    <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>u/{d.author}</span>
-                    <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>▲ {d.score} upvotes</span>
-                    {d.sentiment_label && (
-                      <span style={{
-                        padding: '1px 6px', borderRadius: 10, fontSize: 10, fontWeight: 700,
-                        background: d.sentiment_label === 'positive' ? 'rgba(34,197,94,0.15)' : d.sentiment_label === 'negative' ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
-                        color: d.sentiment_label === 'positive' ? '#22c55e' : d.sentiment_label === 'negative' ? '#ef4444' : '#f59e0b',
-                      }}>
-                        {d.sentiment_label}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 380, overflowY: 'auto' }}>
+              {videoEngagement.discussions.map((d, i) => (
+                <div
+                  key={d.discussion_id || i}
+                  style={{
+                    padding: 12, borderRadius: 8,
+                    background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)',
+                    display: 'flex', flexDirection: 'column', gap: 6,
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                      <span style={{ padding: '2px 7px', borderRadius: 4, background: 'rgba(244,63,94,0.15)', color: 'var(--rd-primary)', fontWeight: 700, fontSize: 11 }}>
+                        r/{d.subreddit}
                       </span>
+                      <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>u/{d.author}</span>
+                      <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>▲ {d.score} upvotes</span>
+                      {d.match_type && (
+                        <span style={{
+                          padding: '1px 6px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+                          background: d.match_type === 'url' ? 'rgba(34,197,94,0.12)' : 'rgba(99,102,241,0.12)',
+                          color: d.match_type === 'url' ? '#22c55e' : 'var(--cx-primary)',
+                          border: `1px solid ${d.match_type === 'url' ? 'rgba(34,197,94,0.25)' : 'rgba(99,102,241,0.25)'}`,
+                        }}>
+                          {d.match_type === 'url' ? 'Direct Link' : 'Topic Debate'}
+                        </span>
+                      )}
+                      {d.sentiment_label && (
+                        <span style={{
+                          padding: '1px 6px', borderRadius: 10, fontSize: 10, fontWeight: 700,
+                          background: d.sentiment_label === 'positive' ? 'rgba(34,197,94,0.15)' : d.sentiment_label === 'negative' ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
+                          color: d.sentiment_label === 'positive' ? '#22c55e' : d.sentiment_label === 'negative' ? '#ef4444' : '#f59e0b',
+                        }}>
+                          {d.sentiment_label}
+                        </span>
+                      )}
+                    </div>
+                    {d.permalink && (
+                      <a
+                        href={normalizeRedditUrl(d.permalink)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: 'var(--cx-primary)', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4 }}
+                      >
+                        View on Reddit <ExternalLink size={11} />
+                      </a>
                     )}
                   </div>
-                  {d.permalink && (
-                    <a
-                      href={normalizeRedditUrl(d.permalink)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      style={{ color: 'var(--cx-primary)', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4 }}
-                    >
-                      View on Reddit <ExternalLink size={11} />
-                    </a>
-                  )}
+                  <p style={{ fontSize: 12, color: 'var(--text-primary)', lineHeight: 1.5, margin: 0 }}>
+                    {d.body}
+                  </p>
                 </div>
-                <p style={{ fontSize: 12, color: 'var(--text-primary)', lineHeight: 1.5, margin: 0 }}>
-                  {d.body}
-                </p>
-              </div>
-            ))}
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(107,114,128,0.2)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              <MessageSquare size={16} color="var(--text-muted)" />
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+                Reddit Discussions Found Across All Subreddits (0)
+              </h3>
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0, lineHeight: 1.5 }}>
+              No Reddit posts or comments found referencing this video or creator across tracked communities.
+            </p>
+          </div>
+        )
+      )}
+
+      {/* ── Shared Videos Table — only in Explore Subreddits mode ────── */}
+      {mode === 'subreddit' && (
+        <div className="glass-card" style={{ padding: 20 }}>
+          <div style={{ marginBottom: 14 }}>
+            <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--rd-primary)', paddingLeft: 10 }}>
+              YouTube Videos Shared in r/{activeSub || '…'}
+            </h3>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              Click the discussion button on any row to see the Reddit comments that linked the video.
+            </p>
+          </div>
+          <div style={{ border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
+            <SharedVideosTable
+              videos={shared}
+              loading={sharedLoading}
+              showTopBadge={false}
+            />
           </div>
         </div>
       )}
 
-      {/* ── Shared Videos Table (with expandable discussion drawer) ────── */}
-      <div className="glass-card" style={{ padding: 20 }}>
-        <div style={{ marginBottom: 14 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--rd-primary)', paddingLeft: 10 }}>
-            YouTube Videos Shared in r/{activeSub}
-          </h3>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-            Click the discussion button on any row to see the Reddit comments that linked the video.
-          </p>
-        </div>
-        <div style={{ border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
-          <SharedVideosTable
-            videos={shared}
-            loading={sharedLoading}
-            showTopBadge={false}
-          />
-        </div>
-      </div>
-
-      {/* ── Sentiment Comparison ─────────────────────────────────────────── */}
-      <div className="glass-card" style={{ padding: 20 }}>
-        <div style={{ marginBottom: 14 }}>
-          <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
-            Audience Sentiment: YouTube vs Reddit
-          </h3>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-            How audience reaction on YouTube differs from the Reddit discussion for the same content.
-          </p>
-        </div>
-        <CrossSentimentChart data={effectiveSentiment} loading={sentLoading || (Boolean(activeVideo) && videoLoading)} />
-      </div>
-
-      {/* ── Top YouTube Videos for Topic ──────────────────────────────────── */}
-      <div className="glass-card" style={{ padding: 20 }}>
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <TrendingUp size={18} color="var(--cx-primary)" />
-            <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
-              Top YouTube Videos for "{activeSub}"
-            </h3>
+      {/* ── Sentiment Comparison — only in Analyze a Video mode ─────────── */}
+      {mode === 'video' && (
+        <div className="glass-card" style={{ padding: 20 }}>
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
+                Audience Sentiment: YouTube vs Reddit
+              </h3>
+              {activeVideo ? (
+                <span style={{
+                  fontSize: 10, fontWeight: 800, padding: '2px 8px', borderRadius: 10,
+                  background: 'rgba(6,182,212,0.15)', border: '1px solid rgba(6,182,212,0.3)',
+                  color: 'var(--cx-primary)',
+                }}>
+                  VIDEO {effectiveSentiment?._videoId || activeVideo}
+                </span>
+              ) : (
+                <span style={{
+                  fontSize: 10, fontWeight: 800, padding: '2px 8px', borderRadius: 10,
+                  background: 'rgba(107,114,128,0.12)', border: '1px solid rgba(107,114,128,0.25)',
+                  color: 'var(--text-muted)',
+                }}>
+                  Awaiting video
+                </span>
+              )}
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              {activeVideo
+                ? 'How audience reaction on YouTube differs from Reddit discussion for the analyzed video above.'
+                : 'Paste a YouTube URL or video ID above and click Analyze Video to see sentiment comparison.'}
+            </p>
           </div>
-          <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-            Most viewed YouTube videos related to this subreddit topic, fetched live from YouTube.
-          </p>
-        </div>
-        <div style={{ border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
-          <SharedVideosTable
-            videos={topVideos}
-            loading={topLoading}
-            showTopBadge={true}
+          <CrossSentimentChart
+            data={activeVideo ? effectiveSentiment : null}
+            loading={activeVideo ? sentimentLoading : false}
           />
         </div>
-      </div>
+      )}
+
+      {/* ── Top YouTube Videos for Topic — only in Explore Subreddits mode ── */}
+      {mode === 'subreddit' && (
+        <div className="glass-card" style={{ padding: 20 }}>
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <TrendingUp size={18} color="var(--cx-primary)" />
+              <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)', borderLeft: '3px solid var(--cx-primary)', paddingLeft: 10 }}>
+                Top YouTube Videos for "{activeSub || '…'}"
+              </h3>
+            </div>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
+              Most viewed YouTube videos related to this subreddit topic, fetched live from YouTube.
+            </p>
+          </div>
+          <div style={{ border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
+            <SharedVideosTable
+              videos={topVideos}
+              loading={topLoading}
+              showTopBadge={true}
+            />
+          </div>
+        </div>
+      )}
 
     </div>
   );

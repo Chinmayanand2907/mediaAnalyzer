@@ -200,6 +200,166 @@ def _normalise_engagement(raw: Dict[str, Any], platform: str) -> float:
     return round(min(max(score, 0.0), 100.0), 2)
 
 
+async def _fetch_youtube_video_comments(vid_id: str, max_comments: int = 50) -> List[str]:
+    """Fetch top comments for a specific YouTube video live via YouTube Data API."""
+    try:
+        from app.services.external.youtube_client import YouTubeClient
+        yt_client = YouTubeClient()
+        ct_req = yt_client._service.commentThreads().list(
+            part="snippet",
+            videoId=vid_id,
+            maxResults=min(max_comments, 100),
+            order="relevance",
+            textFormat="plainText",
+        )
+        ct_data = await _asyncio.to_thread(ct_req.execute)
+        comments = []
+        for item in ct_data.get("items", []):
+            text = (
+                item.get("snippet", {})
+                .get("topLevelComment", {})
+                .get("snippet", {})
+                .get("textDisplay", "")
+            )
+            if text and len(text.strip()) > 5:
+                comments.append(text.strip())
+        return comments
+    except Exception:
+        return []
+
+
+async def _fetch_reddit_video_discussions(
+    vid_id: str,
+    title: str = "",
+    channel_title: str = "",
+    tags: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Search Reddit for discussions of a specific video:
+    1. Exact URL / ID matches across all subreddits.
+    2. Targeted search by creator name + topic keywords if few direct URL posts exist.
+       Strictly validates that candidate posts explicitly reference the creator and topic.
+    Returns list of discussion post dicts with their top comments.
+    """
+    from app.services.external.reddit_client import RedditClient
+    reddit_client = RedditClient()
+    tags = tags or []
+
+    def _search_reddit_sync():
+        seen_posts = {}
+
+        # 1. Exact URL / ID queries
+        url_queries = [
+            f"url:youtu.be/{vid_id}",
+            f"url:youtube.com/watch?v={vid_id}",
+            vid_id,
+        ]
+        for q in url_queries:
+            try:
+                submissions = list(reddit_client._reddit.subreddit("all").search(query=q, sort="relevance", limit=15))
+                for s in submissions:
+                    if s.id not in seen_posts:
+                        post_text = ((getattr(s, 'url', '') or '') + ' ' + (getattr(s, 'selftext', '') or '') + ' ' + (getattr(s, 'title', '') or ''))
+                        if vid_id in post_text:
+                            seen_posts[s.id] = (s, "url", 1.0)
+            except Exception:
+                pass
+
+        # 2. Targeted creator + topic search if few direct URL posts exist
+        if len(seen_posts) < 5 and channel_title:
+            clean_creator = re.sub(r'(official|channel|tv|hd|yt|hindi|english)', '', channel_title, flags=re.I).strip().lower()
+            creator_variants = [clean_creator]
+            if ' ' in clean_creator:
+                creator_variants.extend([p for p in clean_creator.split() if len(p) >= 3])
+            for t in tags:
+                t_clean = t.strip().lower()
+                if clean_creator in t_clean and t_clean != clean_creator:
+                    creator_variants.append(t_clean)
+
+            # Filter stopwords to find core topic words from video title
+            stopwords = {
+                'how', 'much', 'do', 'you', 'really', 'need', 'in', 'to', 'the', 'a', 'an', 'is', 'are',
+                'for', 'of', 'and', 'or', 'on', 'at', 'this', 'that', 'with', 'from', 'what', 'your',
+                'video', 'about', 'why', 'can', 'will', 'just', 'best', 'top', 'new', 'vs',
+            }
+            raw_words = re.findall(r'[a-zA-Z]{3,}', title.lower())
+            topic_words = [w for w in raw_words if w not in stopwords]
+
+            # Construct targeted creator + topic queries
+            topic_queries = []
+            for tw in topic_words[:3]:
+                topic_queries.append(f'"{clean_creator}" {tw}')
+            for t in tags[:3]:
+                if t.lower() != clean_creator and len(t) > 3:
+                    topic_queries.append(f'"{clean_creator}" "{t}"')
+
+            # Exclude known automated/spam subreddits
+            spam_sub_patterns = re.compile(r'(autonewspaper|bot|moderator|spam|promos)', re.I)
+
+            for q in topic_queries[:5]:
+                try:
+                    submissions = list(reddit_client._reddit.subreddit("all").search(query=q, sort="relevance", limit=10))
+                    for s in submissions:
+                        sub_name = str(s.subreddit)
+                        if spam_sub_patterns.search(sub_name) or s.score < 0:
+                            continue
+                        if s.id in seen_posts:
+                            continue
+
+                        post_text = ((getattr(s, 'url', '') or '') + ' ' + (getattr(s, 'selftext', '') or '') + ' ' + (getattr(s, 'title', '') or '')).lower()
+                        # Strict validation: MUST mention creator variant AND at least one topic word
+                        has_creator = any(cv in post_text for cv in creator_variants)
+                        matching_topics = [tw for tw in topic_words if tw in post_text]
+                        if has_creator and matching_topics:
+                            seen_posts[s.id] = (s, "topic", 0.85)
+                except Exception:
+                    pass
+
+        # 3. Extract top comments and post threads
+        results = []
+        for post, match_type, sim_score in seen_posts.values():
+            try:
+                post.comment_sort = "top"
+                post.comments.replace_more(limit=0)
+                top_comments = []
+                for c in post.comments[:10]:
+                    if hasattr(c, "body") and c.body:
+                        body_strip = c.body.strip()
+                        author_name = str(c.author) if c.author else "[deleted]"
+                        # Filter bot/deleted comments
+                        if author_name.lower() in {"automoderator", "[deleted]"} or body_strip in {"[deleted]", "[removed]"}:
+                            continue
+                        if len(body_strip) < 5:
+                            continue
+                        top_comments.append({
+                            "id": c.id,
+                            "author": author_name,
+                            "body": body_strip,
+                            "score": c.score,
+                            "created_utc": c.created_utc,
+                            "permalink": f"https://reddit.com{c.permalink}",
+                        })
+                results.append({
+                    "post_id": post.id,
+                    "subreddit": str(post.subreddit),
+                    "title": post.title,
+                    "selftext": post.selftext or "",
+                    "author": str(post.author) if post.author else "[deleted]",
+                    "score": post.score,
+                    "created_utc": post.created_utc,
+                    "permalink": f"https://reddit.com{post.permalink}",
+                    "url": getattr(post, 'url', ''),
+                    "match_type": match_type,
+                    "similarity_score": sim_score,
+                    "comments": top_comments,
+                })
+            except Exception:
+                pass
+        return results
+
+    return await reddit_client._run_in_thread(_search_reddit_sync)
+
+
 # ─── Endpoints ───────────────────────────────────────────────────────────────
 
 @router.get(
@@ -218,9 +378,9 @@ async def get_shared_videos(
     ),
     limit: int = Query(
         default=500,
-        ge=50,
+        ge=1,
         le=2000,
-        description="Number of Reddit comments to scan",
+        description="Number of Reddit comments to scan (min 1 for global recently-tracked queries)",
     ),
 ) -> List[SharedVideoItem]:
     """
@@ -633,8 +793,14 @@ async def get_shared_videos(
             )
         )
 
-    # Sort by total Reddit shares descending, then YouTube views
-    shared.sort(key=lambda x: (x.total_reddit_shares, x.youtube_views or 0), reverse=True)
+    # Sort: subreddit-scoped → by total Reddit shares desc then YouTube views.
+    # Global (no subreddit filter) → by most recently ingested first so that
+    # the "recently tracked" chips on the frontend show the latest videos.
+    if subreddit_name:
+        shared.sort(key=lambda x: (x.total_reddit_shares, x.youtube_views or 0), reverse=True)
+    else:
+        # Keep insertion order (already sorted by ingested_at desc from cursor)
+        pass
     return shared
 
 
@@ -760,9 +926,20 @@ async def get_video_engagement(
     )
     all_reddit_docs = await reddit_cursor.to_list(length=scan_limit)
 
+    # Build all YouTube URL patterns that reference this video ID
+    _yt_url_patterns = [
+        vid_id,                                        # bare ID anywhere in text
+        f"youtu.be/{vid_id}",                          # short URL
+        f"watch?v={vid_id}",                           # standard URL
+        f"youtube.com/watch?v={vid_id}",               # full standard URL
+        f"youtube.com/shorts/{vid_id}",                # shorts
+        f"youtube.com/embed/{vid_id}",                 # embed
+    ]
+
     for doc in all_reddit_docs:
         body = doc.get("body", "")
-        if vid_id in body:
+        # Match if any known URL pattern for this video appears in the body
+        if any(pat in body for pat in _yt_url_patterns) or bool(_YT_URL_RE.search(body) and vid_id in _YT_URL_RE.findall(body)):
             d_id = doc.get("platform_id")
             if d_id and d_id not in seen_discussion_ids:
                 seen_discussion_ids.add(d_id)
@@ -771,93 +948,26 @@ async def get_video_engagement(
                 d_copy["similarity_score"] = 1.0
                 matched_discussions.append(d_copy)
 
-    # Semantic similarity matching on remaining local Reddit comments
-    unmatched_local_docs = [
-        d for d in all_reddit_docs
-        if (d.get("platform_id") or d.get("permalink") or d.get("body")) not in seen_discussion_ids
-    ]
-    if unmatched_local_docs and (title or yt_tags):
-        from app.services.analytics.semantic_matcher import get_semantic_matcher
-        from app.core.config import get_settings
-        current_settings = get_settings()
+    # NOTE: Semantic similarity matching is intentionally DISABLED for the
+    # video-engagement endpoint. It produced false positives: a video titled
+    # "How Much Salary Do You Need in India?" would semantically match any
+    # Reddit comment about money/salary/India, even from completely unrelated
+    # subreddits.  Only exact URL-based references are reliable for verifying
+    # that a Reddit discussion actually references THIS specific video.
 
-        matcher = get_semantic_matcher()
-        cand_video = [{
-            "video_id": vid_id,
-            "title": title or "",
-            "description": " ".join(yt_tags) if yt_tags else "",
-        }]
-        sem_matches = matcher.match_discussions_to_videos(
-            unmatched_local_docs,
-            cand_video,
-            threshold=current_settings.SEMANTIC_SIMILARITY_THRESHOLD,
-        )
-        for _, disc_list in sem_matches.items():
-            for d_doc, score in disc_list:
-                d_id = d_doc.get("platform_id") or d_doc.get("permalink") or d_doc.get("body")
-                if d_id not in seen_discussion_ids:
-                    seen_discussion_ids.add(d_id)
-                    d_copy = dict(d_doc)
-                    d_copy["match_type"] = "semantic"
-                    d_copy["similarity_score"] = score
-                    matched_discussions.append(d_copy)
-
-    # 2B. Search the ENTIRE Reddit platform live via PRAW (reddit.subreddit('all').search)
+    # 2B. Live Reddit search: exact URLs first, then creator+topic discussions
     try:
-        reddit_client = RedditClient()
-        search_queries = [vid_id, f"url:{vid_id}"]
-        if title:
-            clean_title = re.sub(r"[\?\|!#\[\]\(\)]", " ", title).split("|")[0].split(" - ")[0].strip()
-            if len(clean_title) > 10:
-                search_queries.append(f'"{clean_title}"')
-            if channel_title and len(clean_title) > 5:
-                search_queries.append(f'"{channel_title}" {clean_title[:30]}')
-
-        def _search_global_reddit():
-            seen_posts = {}
-            for q in search_queries:
-                try:
-                    submissions = list(reddit_client._reddit.subreddit("all").search(query=q, sort="relevance", limit=10))
-                    for s in submissions:
-                        if s.id not in seen_posts:
-                            seen_posts[s.id] = s
-                except Exception:
-                    pass
-
-            live_results = []
-            for post in seen_posts.values():
-                try:
-                    post.comment_sort = "top"
-                    post.comments.replace_more(limit=0)
-                    top_comments = []
-                    for c in post.comments[:10]:
-                        if hasattr(c, "body") and c.body:
-                            top_comments.append({
-                                "id": c.id,
-                                "author": str(c.author) if c.author else "[deleted]",
-                                "body": c.body,
-                                "score": c.score,
-                                "created_utc": c.created_utc,
-                                "permalink": f"https://reddit.com{c.permalink}",
-                            })
-                    live_results.append({
-                        "post_id": post.id,
-                        "subreddit": str(post.subreddit),
-                        "title": post.title,
-                        "selftext": post.selftext or "",
-                        "author": str(post.author) if post.author else "[deleted]",
-                        "score": post.score,
-                        "created_utc": post.created_utc,
-                        "permalink": f"https://reddit.com{post.permalink}",
-                        "comments": top_comments,
-                    })
-                except Exception:
-                    pass
-            return live_results
-
-        live_reddit_posts = await reddit_client._run_in_thread(_search_global_reddit)
+        live_reddit_posts = await _fetch_reddit_video_discussions(
+            vid_id=vid_id,
+            title=title or "",
+            channel_title=channel_title or "",
+            tags=yt_tags or [],
+        )
 
         for p in live_reddit_posts:
+            p_match_type = p.get("match_type", "url")
+            p_sim_score = p.get("similarity_score", 1.0)
+
             # Add top comments from this post
             for c in p.get("comments", []):
                 c_id = c["id"]
@@ -873,16 +983,18 @@ async def get_video_engagement(
                         "score": c["score"],
                         "published_at": pub_iso,
                         "permalink": c["permalink"],
+                        "match_type": p_match_type,
+                        "similarity_score": p_sim_score,
                         "sentiment_label": None,
                         "sentiment_score": None,
                     })
 
-            # If no comments or in addition, include the post thread itself as a discussion
+            # Also include the post thread itself as a discussion
             p_id = p["post_id"]
             if p_id not in seen_discussion_ids:
                 seen_discussion_ids.add(p_id)
                 pub_iso = datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat() if p.get("created_utc") else None
-                body_text = p["title"] + (f" - {p['selftext'][:200]}" if p.get("selftext") else "")
+                body_text = p["title"] + (f" - {p['selftext'][:250]}" if p.get("selftext") else "")
                 matched_discussions.append({
                     "platform_id": p_id,
                     "post_id": p_id,
@@ -892,6 +1004,8 @@ async def get_video_engagement(
                     "score": p["score"],
                     "published_at": pub_iso,
                     "permalink": p["permalink"],
+                    "match_type": p_match_type,
+                    "similarity_score": p_sim_score,
                     "sentiment_label": None,
                     "sentiment_score": None,
                 })
@@ -909,13 +1023,13 @@ async def get_video_engagement(
 
     # Check for unlabelled sentiment
     unlabeled_bodies = [d.get("body", "") for d in matched_discussions if not d.get("sentiment_label") and d.get("body")]
-    quick_sentiment_map: Dict[str, str] = {}
+    quick_sentiment_map: Dict[str, Tuple[str, float]] = {}
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
-            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_bodies[:50])
-            for text, res in zip(unlabeled_bodies[:50], batch_res):
-                quick_sentiment_map[text] = res.label.value
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_bodies[:100])
+            for text, res in zip(unlabeled_bodies[:100], batch_res):
+                quick_sentiment_map[text] = (res.label.value, res.score)
         except Exception:
             pass
 
@@ -936,8 +1050,14 @@ async def get_video_engagement(
             discussion_dates.append(pub_dt)
 
         label = r_doc.get("sentiment_label")
+        s_score = r_doc.get("sentiment_score")
         if not label:
-            label = quick_sentiment_map.get(r_doc.get("body", ""), "neutral")
+            mapped = quick_sentiment_map.get(r_doc.get("body", ""))
+            if mapped:
+                label, s_score = mapped
+            else:
+                label = "neutral"
+                s_score = 0.5
         reddit_sentiments.append(label)
         if r_doc.get("body"):
             discussion_bodies.append(r_doc["body"])
@@ -953,9 +1073,9 @@ async def get_video_engagement(
                 published_at=pub_str,
                 permalink=r_doc.get("permalink"),
                 sentiment_label=label,
-                sentiment_score=r_doc.get("sentiment_score"),
+                sentiment_score=s_score,
                 match_type=r_doc.get("match_type", "url"),
-                similarity_score=r_doc.get("similarity_score"),
+                similarity_score=r_doc.get("similarity_score", 1.0),
             )
         )
 
@@ -984,47 +1104,59 @@ async def get_video_engagement(
     elif first_shared_dt:
         propagation_speed = "Community Discovered"
 
-    # 5. YouTube sentiment from MongoDB
+    # 5. YouTube sentiment — from MongoDB first, then live YouTube API fallback
     yt_comments_cursor = comments_coll.find(
-        {"platform": "youtube", "parent_id": vid_id},
-        {"_id": 0, "sentiment_label": 1},
+        {"platform": "youtube", "$or": [{"video_id": vid_id}, {"parent_id": vid_id}]},
+        {"_id": 0, "sentiment_label": 1, "body": 1},
     )
     yt_comments_docs = await yt_comments_cursor.to_list(length=200)
     yt_sent_labels = [d.get("sentiment_label") for d in yt_comments_docs if d.get("sentiment_label")]
+
+    # If MongoDB has insufficient YouTube comments for this video, fetch live from YouTube API
+    if len(yt_sent_labels) < 5:
+        live_yt_bodies = await _fetch_youtube_video_comments(vid_id, max_comments=50)
+        if live_yt_bodies:
+            try:
+                svc = _get_sentiment_svc()
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:50])
+                yt_sent_labels.extend([r.label.value for r in batch_res])
+            except Exception:
+                pass
+
     yt_sentiment: Optional[PlatformSentimentBreakdown] = None
     if yt_sent_labels:
-        n_yt = len(yt_sent_labels)
-        pos = yt_sent_labels.count("positive") / n_yt
-        neu = yt_sent_labels.count("neutral") / n_yt
-        neg = yt_sent_labels.count("negative") / n_yt
-        dom = max([("positive", pos), ("neutral", neu), ("negative", neg)], key=lambda x: x[1])[0]
-        yt_sentiment = PlatformSentimentBreakdown(
-            positive=round(pos, 3), neutral=round(neu, 3), negative=round(neg, 3),
-            dominant_label=dom, sample_size=n_yt,
-        )
+        yt_sentiment = _compute_sentiment_breakdown(yt_sent_labels)
 
     # 6. Reddit sentiment
     rd_sentiment: Optional[PlatformSentimentBreakdown] = None
     if reddit_sentiments:
-        n_rd = len(reddit_sentiments)
-        pos = reddit_sentiments.count("positive") / n_rd
-        neu = reddit_sentiments.count("neutral") / n_rd
-        neg = reddit_sentiments.count("negative") / n_rd
-        dom = max([("positive", pos), ("neutral", neu), ("negative", neg)], key=lambda x: x[1])[0]
-        rd_sentiment = PlatformSentimentBreakdown(
-            positive=round(pos, 3), neutral=round(neu, 3), negative=round(neg, 3),
-            dominant_label=dom, sample_size=n_rd,
-        )
+        rd_sentiment = _compute_sentiment_breakdown(reddit_sentiments)
 
     disparity_note: Optional[str] = None
-    if yt_sentiment and rd_sentiment:
+    if yt_sentiment and rd_sentiment and yt_sentiment.sample_size > 0 and rd_sentiment.sample_size > 0:
         gap = round(yt_sentiment.positive - rd_sentiment.positive, 2)
+        subs_text = f" across {len(subreddits_set)} subreddits" if subreddits_set else ""
         if gap > 0.15:
-            disparity_note = f"YouTube audience is significantly more positive (+{int(gap*100)}% gap)."
+            disparity_note = (
+                f"YouTube audience is significantly more positive (+{int(gap*100)}% gap; "
+                f"{int(yt_sentiment.positive*100)}% positive on YouTube vs {int(rd_sentiment.positive*100)}% on Reddit{subs_text}). "
+                "Reddit discussions reflect deeper critical debate and community skepticism."
+            )
         elif gap < -0.15:
-            disparity_note = f"Reddit discussion is significantly more positive (+{int(abs(gap)*100)}% gap)."
+            disparity_note = (
+                f"Reddit discussion is significantly more positive (+{int(abs(gap)*100)}% gap; "
+                f"{int(rd_sentiment.positive*100)}% positive on Reddit vs {int(yt_sentiment.positive*100)}% on YouTube). "
+                "The Reddit community responded notably more favorably than YouTube comment threads."
+            )
         else:
-            disparity_note = "Sentiment is well aligned across both platforms."
+            disparity_note = (
+                f"Sentiment is well aligned between YouTube ({int(yt_sentiment.positive*100)}% pos) "
+                f"and Reddit ({int(rd_sentiment.positive*100)}% pos{subs_text})."
+            )
+    elif yt_sentiment and yt_sentiment.sample_size > 0:
+        disparity_note = f"YouTube audience sentiment is {int(yt_sentiment.positive*100)}% positive ({yt_sentiment.sample_size} comments). No Reddit community discussions found referencing this video yet."
+    elif rd_sentiment and rd_sentiment.sample_size > 0:
+        disparity_note = f"Reddit discussion sentiment is {int(rd_sentiment.positive*100)}% positive ({rd_sentiment.sample_size} comments analyzed)."
 
     topics = _extract_topics_from_texts(discussion_bodies, top_n=6)
 
@@ -1091,91 +1223,171 @@ async def get_sentiment_comparison(
 
     vid_id = _extract_video_id(video_url_or_id) if video_url_or_id else None
 
-    rd_cursor = comments_coll.find(rd_filter, {"_id": 0, "sentiment_label": 1, "body": 1}).limit(200)
-    rd_docs = await rd_cursor.to_list(length=200)
+    rd_labels: List[str] = []
 
-    # Filter by video ID if provided
     if vid_id:
-        rd_docs = [d for d in rd_docs if vid_id in d.get("body", "")]
+        # Match Reddit comments from MongoDB
+        rd_cursor = comments_coll.find(
+            {"platform": "reddit", "body": {"": re.escape(vid_id), "off on off off off off off off off off on off on off off off off off on off off off on on off off off off on off off off off off off off off off off off off on off off off off off off off on off on on off off off on off off on off off on off off on off on off off on off on off off off off on off off off on off off on off off off off off off off off on off on off off on off off off off off off off off off off off off on off off off on off on off on on off off off off on on off off on on off on off on on off off off off on on off off on off off off off off on off off on off off on off off off off off off on off off off off on on off on off off off off off on off on off off off off off off off off off off on on off on off off off": "i"}},
+            {"_id": 0, "sentiment_label": 1, "body": 1},
+        ).limit(100)
+        rd_docs = await rd_cursor.to_list(length=100)
+        rd_labels = [d.get("sentiment_label") for d in rd_docs if d.get("sentiment_label")]
+        unlabeled_rd = [d["body"] for d in rd_docs if not d.get("sentiment_label") and d.get("body")]
 
-    rd_labels = [d.get("sentiment_label") for d in rd_docs if d.get("sentiment_label")]
-    unlabeled_rd = [d["body"] for d in rd_docs if not d.get("sentiment_label") and d.get("body")]
-
-    if len(rd_labels) < 5 and unlabeled_rd:
-        try:
-            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_rd[:40])
-            rd_labels.extend([r.label.value for r in batch_res])
-        except Exception:
-            pass
-
-    # If still no Reddit comments in DB, fetch live from Reddit
-    if len(rd_labels) < 3 and clean_sub:
-        try:
-            reddit_client = RedditClient()
-            hot = await reddit_client.fetch_hot_threads(clean_sub, limit=3)
-            live_bodies = []
-            for t in hot.threads[:2]:
-                det = await reddit_client.fetch_post_details(t.post_id, comment_limit=10)
-                live_bodies.extend([c.body for c in det.comments if c.body])
-            if live_bodies:
-                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_bodies[:30])
+        if len(rd_labels) < 5 and unlabeled_rd:
+            try:
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_rd[:40])
                 rd_labels.extend([r.label.value for r in batch_res])
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        # If MongoDB has few Reddit comments, fetch live discussions
+        if len(rd_labels) < 5:
+            v_title = ""
+            v_channel = ""
+            v_tags: List[str] = []
+            try:
+                yt_cli = YouTubeClient()
+                v_det = await _asyncio.to_thread(yt_cli._service.videos().list(part="snippet", id=vid_id).execute)
+                v_items = v_det.get("items", [])
+                if v_items:
+                    snip = v_items[0].get("snippet", {})
+                    v_title = snip.get("title", "")
+                    v_channel = snip.get("channelTitle", "")
+                    v_tags = snip.get("tags", [])
+            except Exception:
+                pass
+
+            live_posts = await _fetch_reddit_video_discussions(
+                vid_id=vid_id,
+                title=v_title,
+                channel_title=v_channel,
+                tags=v_tags,
+            )
+            live_bodies = []
+            for lp in live_posts:
+                for c in lp.get("comments", []):
+                    if c.get("body"):
+                        live_bodies.append(c["body"])
+                if lp.get("title"):
+                    live_bodies.append(lp["title"])
+            if live_bodies:
+                try:
+                    batch_res = await _asyncio.to_thread(svc.analyze_batch, live_bodies[:60])
+                    rd_labels.extend([r.label.value for r in batch_res])
+                except Exception:
+                    pass
+
+    elif clean_sub:
+        rd_cursor = comments_coll.find(
+            {"platform": "reddit", "parent_id": {"": f"^{re.escape(clean_sub)}$", "off on off off off off off off off off on off on off off off off off on off off off on on off off off off on off off off off off off off off off off off off on off off off off off off off on off on on off off off on off off on off off on off off on off on off off on off on off off off off on off off off on off off on off off off off off off off off on off on off off on off off off off off off off off off off off off on off off off on off on off on on off off off off on on off off on on off on off on on off off off off on on off off on off off off off off on off off on off off on off off off off off off on off off off off on on off on off off off off off on off on off off off off off off off off off off on on off on off off off": "i"}},
+            {"_id": 0, "sentiment_label": 1, "body": 1},
+        ).limit(200)
+        rd_docs = await rd_cursor.to_list(length=200)
+        rd_labels = [d.get("sentiment_label") for d in rd_docs if d.get("sentiment_label")]
+        unlabeled_rd = [d["body"] for d in rd_docs if not d.get("sentiment_label") and d.get("body")]
+
+        if len(rd_labels) < 5 and unlabeled_rd:
+            try:
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_rd[:40])
+                rd_labels.extend([r.label.value for r in batch_res])
+            except Exception:
+                pass
+
+        if len(rd_labels) < 3:
+            try:
+                reddit_client = RedditClient()
+                hot = await reddit_client.fetch_hot_threads(clean_sub, limit=3)
+                live_bodies = []
+                for t in hot.threads[:2]:
+                    det = await reddit_client.fetch_post_details(t.post_id, comment_limit=10)
+                    live_bodies.extend([c.body for c in det.comments if c.body])
+                if live_bodies:
+                    batch_res = await _asyncio.to_thread(svc.analyze_batch, live_bodies[:30])
+                    rd_labels.extend([r.label.value for r in batch_res])
+            except Exception:
+                pass
 
     rd_sentiment = _compute_sentiment_breakdown(rd_labels)
 
     # 2. Fetch YouTube sentiment distribution
-    yt_filter: Dict[str, Any] = {"platform": "youtube"}
+    yt_labels: List[str] = []
     if vid_id:
-        yt_filter["platform_id"] = vid_id
+        yt_cursor = comments_coll.find(
+            {"platform": "youtube", "": [{"video_id": vid_id}, {"parent_id": vid_id}]},
+            {"_id": 0, "sentiment_label": 1, "body": 1},
+        ).limit(200)
+        yt_docs = await yt_cursor.to_list(length=200)
+        yt_labels = [d.get("sentiment_label") for d in yt_docs if d.get("sentiment_label")]
+        unlabeled_yt = [d["body"] for d in yt_docs if not d.get("sentiment_label") and d.get("body")]
 
-    yt_cursor = comments_coll.find(yt_filter, {"_id": 0, "sentiment_label": 1, "body": 1}).limit(200)
-    yt_docs = await yt_cursor.to_list(length=200)
-    yt_labels = [d.get("sentiment_label") for d in yt_docs if d.get("sentiment_label")]
-    unlabeled_yt = [d["body"] for d in yt_docs if not d.get("sentiment_label") and d.get("body")]
-
-    if len(yt_labels) < 5 and unlabeled_yt:
-        try:
-            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_yt[:40])
-            yt_labels.extend([r.label.value for r in batch_res])
-        except Exception:
-            pass
-
-    # If YouTube comments not in DB, fetch top YouTube comments for the topic/video live
-    if len(yt_labels) < 3:
-        try:
-            yt_client = YouTubeClient()
-            search_query = clean_sub or (vid_id or "popular")
-            s_req = yt_client._service.search().list(part="snippet", q=search_query, type="video", maxResults=2)
-            s_data = await _asyncio.to_thread(s_req.execute)
-            live_yt_bodies = []
-            for it in s_data.get("items", []):
-                v_id = it.get("id", {}).get("videoId")
-                if v_id:
-                    c_req = yt_client._service.commentThreads().list(part="snippet", videoId=v_id, maxResults=15)
-                    c_data = await _asyncio.to_thread(c_req.execute)
-                    for item in c_data.get("items", []):
-                        text = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {}).get("textDisplay", "")
-                        if text:
-                            live_yt_bodies.append(text)
-            if live_yt_bodies:
-                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:30])
+        if len(yt_labels) < 5 and unlabeled_yt:
+            try:
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_yt[:40])
                 yt_labels.extend([r.label.value for r in batch_res])
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+        # If MongoDB has few YouTube comments, fetch live from video directly
+        if len(yt_labels) < 5:
+            live_yt = await _fetch_youtube_video_comments(vid_id, max_comments=50)
+            if live_yt:
+                try:
+                    batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt[:50])
+                    yt_labels.extend([r.label.value for r in batch_res])
+                except Exception:
+                    pass
+
+    elif clean_sub:
+        yt_filter = {"platform": "youtube"}
+        yt_cursor = comments_coll.find(yt_filter, {"_id": 0, "sentiment_label": 1, "body": 1}).limit(200)
+        yt_docs = await yt_cursor.to_list(length=200)
+        yt_labels = [d.get("sentiment_label") for d in yt_docs if d.get("sentiment_label")]
+        unlabeled_yt = [d["body"] for d in yt_docs if not d.get("sentiment_label") and d.get("body")]
+
+        if len(yt_labels) < 5 and unlabeled_yt:
+            try:
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_yt[:40])
+                yt_labels.extend([r.label.value for r in batch_res])
+            except Exception:
+                pass
+
+        if len(yt_labels) < 3:
+            try:
+                yt_client = YouTubeClient()
+                s_req = yt_client._service.search().list(part="snippet", q=clean_sub, type="video", maxResults=2)
+                s_data = await _asyncio.to_thread(s_req.execute)
+                live_yt_bodies = []
+                for it in s_data.get("items", []):
+                    v_id = it.get("id", {}).get("videoId")
+                    if v_id:
+                        c_req = yt_client._service.commentThreads().list(part="snippet", videoId=v_id, maxResults=15)
+                        c_data = await _asyncio.to_thread(c_req.execute)
+                        for item in c_data.get("items", []):
+                            text = item.get("snippet", {}).get("topLevelComment", {}).get("snippet", {}).get("textDisplay", "")
+                            if text:
+                                live_yt_bodies.append(text)
+                if live_yt_bodies:
+                    batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:30])
+                    yt_labels.extend([r.label.value for r in batch_res])
+            except Exception:
+                pass
 
     yt_sentiment = _compute_sentiment_breakdown(yt_labels)
 
     # Calculate gap (positive sentiment differential)
-    gap = round(yt_sentiment.positive - rd_sentiment.positive, 3)
+    if yt_sentiment.sample_size > 0 and rd_sentiment.sample_size > 0:
+        gap = round(yt_sentiment.positive - rd_sentiment.positive, 3)
+    else:
+        gap = 0.0
 
     if yt_sentiment.sample_size == 0 and rd_sentiment.sample_size == 0:
         summary = "No sentiment comments found for this query yet. Try scanning an active subreddit or video."
     elif yt_sentiment.sample_size == 0:
         summary = f"Reddit discussion sentiment is {int(rd_sentiment.positive*100)}% positive ({rd_sentiment.sample_size} comments analyzed)."
     elif rd_sentiment.sample_size == 0:
-        summary = f"YouTube audience sentiment is {int(yt_sentiment.positive*100)}% positive ({yt_sentiment.sample_size} comments analyzed)."
+        summary = f"YouTube audience sentiment is {int(yt_sentiment.positive*100)}% positive ({yt_sentiment.sample_size} comments analyzed). No Reddit community discussions found for this video yet."
     elif gap > 0.10:
         summary = (
             f"YouTube reception is notably more positive ({int(yt_sentiment.positive*100)}%) "
