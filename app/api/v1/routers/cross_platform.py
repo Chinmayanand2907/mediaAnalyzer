@@ -1023,7 +1023,7 @@ async def get_video_engagement(
 
     # Check for unlabelled sentiment
     unlabeled_bodies = [d.get("body", "") for d in matched_discussions if not d.get("sentiment_label") and d.get("body")]
-    quick_sentiment_map: Dict[str, Tuple[str, float]] = {}
+    quick_sentiment_map: Dict[str, tuple[str, float]] = {}
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
