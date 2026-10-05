@@ -76,6 +76,11 @@ export default function CrossSentimentChart({ data, loading }) {
   );
 
   const hasData = (yt.sample_size || 0) > 0 || (rd.sample_size || 0) > 0 || yt.positive > 0 || rd.positive > 0;
+  const ytN = yt.sample_size || 0;
+  const rdN = rd.sample_size || 0;
+  // A comparison where either side rests on <5 comments is directionally
+  // useful at best — say so instead of rendering bare percentages.
+  const lowSample = hasData && (ytN < 5 || rdN < 5);
 
   // ── Divergence classification ─────────────────────────────────────────────
   const divergence = absGap < 0.05
@@ -150,6 +155,11 @@ export default function CrossSentimentChart({ data, loading }) {
           <p style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
             {summary}
           </p>
+          {lowSample && (
+            <p style={{ fontSize: 11, color: 'var(--neutral)', marginTop: 6 }}>
+              Low sample (YouTube n={ytN}, Reddit n={rdN}) — interpret this comparison with caution.
+            </p>
+          )}
         </div>
       </div>
 

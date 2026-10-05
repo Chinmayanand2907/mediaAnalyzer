@@ -257,9 +257,20 @@ export default function CrossPlatformView() {
   }, [activeVideo, videoEngagement, shared, activeSub]);
 
   // ── Computed KPI Values ────────────────────────────────────────────────
+  // Without a selected video these aggregate the subreddit scan honestly
+  // (distinct subreddits / total discussions across scanned videos).
+  const scannedSubredditsCount = useMemo(() => {
+    if (!shared?.length) return 0;
+    const subs = new Set();
+    for (const v of shared) {
+      for (const s of v.reddit_subreddits || []) subs.add(s);
+      for (const d of v.reddit_discussions || []) if (d.subreddit) subs.add(d.subreddit);
+    }
+    return subs.size;
+  }, [shared]);
   const subredditsDiscussingCount = currentVideoData
     ? currentVideoData.subreddits_count
-    : (shared?.length ? 1 : 0);
+    : scannedSubredditsCount;
 
   const subredditsListText = currentVideoData?.subreddits_list?.length > 0
     ? `r/${currentVideoData.subreddits_list.slice(0, 3).join(', r/')}${currentVideoData.subreddits_list.length > 3 ? ` +${currentVideoData.subreddits_list.length - 3} more` : ''}`

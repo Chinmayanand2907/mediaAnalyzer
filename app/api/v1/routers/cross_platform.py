@@ -167,6 +167,40 @@ def _compute_sentiment_breakdown(labels: List[str]) -> PlatformSentimentBreakdow
     )
 
 
+def _empty_breakdown() -> PlatformSentimentBreakdown:
+    """Honest zero-sample breakdown — used when no measured comments exist.
+
+    Callers must never fabricate sentiment from like ratios or hardcoded
+    distributions; an empty breakdown renders as an explicit "insufficient
+    data" state in the dashboard instead of misleading numbers.
+    """
+    return PlatformSentimentBreakdown(
+        positive=0.0, neutral=0.0, negative=0.0, dominant_label="neutral", sample_size=0
+    )
+
+
+def _has_samples(b: PlatformSentimentBreakdown | None) -> bool:
+    """Return True when a breakdown is backed by at least one measured comment."""
+    return b is not None and b.sample_size > 0
+
+
+def _sentiment_gap(
+    yt: PlatformSentimentBreakdown | None,
+    rd: PlatformSentimentBreakdown | None,
+    *,
+    ndigits: int = 2,
+) -> float:
+    """Shared positive-sentiment gap (YT positive − Reddit positive).
+
+    Returns 0.0 unless BOTH sides have measured samples — a gap against an
+    empty side is meaningless and must not be presented as a finding.
+    Single rounding rule for every cross-platform endpoint.
+    """
+    if not _has_samples(yt) or not _has_samples(rd):
+        return 0.0
+    return round(yt.positive - rd.positive, ndigits)
+
+
 def _normalise_engagement(raw: Dict[str, Any], platform: str) -> float:
     """Produce a 0–100 engagement index from raw platform metrics."""
     import math
@@ -228,27 +262,346 @@ async def _fetch_youtube_video_comments(vid_id: str, max_comments: int = 50) -> 
         return []
 
 
+# ── Video fingerprint helpers ─────────────────────────────────────────────────
+
+# Stopwords used for title keyword extraction (shared between helpers and endpoint)
+_TITLE_STOPWORDS: frozenset = frozenset({
+    'how', 'much', 'do', 'you', 'really', 'need', 'in', 'to', 'the', 'a', 'an', 'is', 'are',
+    'for', 'of', 'and', 'or', 'on', 'at', 'this', 'that', 'with', 'from', 'what', 'your',
+    'video', 'about', 'why', 'can', 'will', 'just', 'best', 'top', 'new', 'vs', 'get', 'has',
+    'its', 'my', 'our', 'their', 'all', 'by', 'be', 'was', 'were', 'it', 'he', 'she', 'they',
+    'watch', 'youtube', 'reddit', 'i', 'me', 'we', 'are', 'so', 'but', 'if', 'up', 'out',
+})
+# Known spam/bot subreddits to skip
+_SPAM_SUB_RE = re.compile(r'(autonewspaper|bot|moderator|spam|promos|autotldr)', re.I)
+
+
+def _build_video_fingerprint(
+    vid_id: str,
+    title: str = "",
+    channel_title: str = "",
+    tags: Optional[List[str]] = None,
+    yt_published_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build a structured fingerprint dict for a YouTube video to use in
+    multi-signal Reddit discussion verification.
+
+    Returns a dict with:
+      - vid_id             : canonical 11-char ID
+      - url_patterns       : list of URL/ID strings that unambiguously identify the video
+      - creator_variants   : normalized creator name tokens for text matching
+      - topic_words        : distinctive content words extracted from the title (≥ 3 chars,
+                             stopword-filtered, de-duplicated, sorted by length descending)
+      - distinctive_phrases: terms highlighted in the title via *, ", [], () — e.g. *ANARC 2*
+                             → "ANARC 2".  Used for high-precision creator+phrase queries.
+      - tag_phrases        : cleaned tag strings (lowercased, ≤ 5 tags)
+      - title_raw          : original title string (for quoted search)
+      - full_text          : title + channel_title + tags joined — for Sentence-BERT encoding
+      - published_ts       : UTC Unix timestamp of video publish date (or None)
+    """
+    tags = tags or []
+
+    # URL patterns that uniquely identify this video
+    url_patterns = [
+        vid_id,
+        f"youtu.be/{vid_id}",
+        f"watch?v={vid_id}",
+        f"youtube.com/watch?v={vid_id}",
+        f"youtube.com/shorts/{vid_id}",
+        f"youtube.com/embed/{vid_id}",
+    ]
+
+    # Normalize creator name: strip generic suffixes, split into tokens
+    clean_creator = re.sub(
+        r'\b(official|channel|tv|hd|yt|hindi|english|media|network|productions|studio|studios)\b',
+        '',
+        channel_title,
+        flags=re.I,
+    ).strip().lower()
+    # Remove any leftover punctuation/digits from creator string
+    clean_creator = re.sub(r'[^a-z\s]', '', clean_creator).strip()
+    creator_variants: List[str] = []
+    if clean_creator:
+        creator_variants.append(clean_creator)
+        # Also add individual tokens that are >= 3 chars (e.g. "mark" from "mark rober")
+        for tok in clean_creator.split():
+            if len(tok) >= 3 and tok not in creator_variants:
+                creator_variants.append(tok)
+
+    # Enhance creator variants using tags (captures aliases like 'MKBHD')
+    # Look for single-word tags >= 5 chars to avoid generic short tags like 'tech'
+    for tag in tags:
+        clean_tag = tag.lower().strip()
+        if ' ' not in clean_tag and len(clean_tag) >= 5 and clean_tag.isalnum():
+            # Exclude common generic single-word tags
+            if clean_tag not in {"review", "unboxing", "vlog", "podcast", "shorts", "video"}:
+                if clean_tag not in creator_variants:
+                    creator_variants.append(clean_tag)
+
+    # Extract distinctive topic words from video title
+    raw_words = re.findall(r'[a-zA-Z]{3,}', title.lower())
+    topic_words = [
+        w for w in dict.fromkeys(raw_words)  # preserve order, de-duplicate
+        if w not in _TITLE_STOPWORDS
+    ]
+    # Sort longer words first — they are more distinctive
+    topic_words.sort(key=len, reverse=True)
+
+    # ── Extract highlighted / bracketed phrases from the title ────────────────
+    # Many YouTubers emphasise the key product/event name using *, ", [], or ().
+    # e.g. "Our New Smartwatch is Here ! *ANARC 2*" → ["ANARC 2"]
+    # These are high-signal terms perfect for a creator+phrase Reddit query.
+    raw_brackets = re.findall(
+        r'[\*\"\[\(]([^\*\"\[\]\(\)]{2,40})[\*\"\]\)]',
+        title,
+    )
+    distinctive_phrases: List[str] = []
+    for bp in raw_brackets:
+        bp_clean = bp.strip()
+        if len(bp_clean) >= 2:
+            distinctive_phrases.append(bp_clean)
+    # De-duplicate while preserving order
+    distinctive_phrases = list(dict.fromkeys(distinctive_phrases))
+
+    # Cleaned tag phrases (lowercase, max 5)
+    tag_phrases = [t.strip().lower() for t in tags[:5] if t.strip()]
+
+    # Full text blob for Sentence-BERT encoding
+    full_text = " ".join(filter(None, [
+        title,
+        channel_title,
+        " ".join(tags[:5]),
+    ]))
+
+    # Parse publish timestamp for date-window filtering
+    published_ts: Optional[float] = None
+    if yt_published_at:
+        try:
+            from datetime import datetime, timezone as _tz
+            published_ts = datetime.fromisoformat(
+                yt_published_at.replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            pass
+
+    return {
+        "vid_id": vid_id,
+        "url_patterns": url_patterns,
+        "creator_variants": creator_variants,
+        "topic_words": topic_words,
+        "distinctive_phrases": distinctive_phrases,
+        "tag_phrases": tag_phrases,
+        "title_raw": title,
+        "full_text": full_text,
+        "published_ts": published_ts,
+    }
+
+
+def _verify_reddit_post_is_about_video(
+    post_text: str,
+    fingerprint: Dict[str, Any],
+) -> tuple[bool, float, str]:
+    """
+    Gate function — determines whether a Reddit post/comment genuinely refers to
+    this specific YouTube video.  Uses three tiers:
+
+    Tier 1 — URL / video-ID match  (score 1.0, tag "url")
+        The post body, title, or linked URL explicitly contains the video ID or
+        any recognised YouTube URL format for this video.  This covers:
+          • Direct YouTube links (youtu.be/..., youtube.com/watch?v=...)
+          • Bare video ID embedded anywhere in the text
+          • Screenshot posts where the screenshotted URL is present in selftext
+
+    Tier 2 — Creator + distinctive phrase match  (score 0.90, tag "phrase_match")
+        Accepted when ALL of the following are true:
+          a. The fingerprint has at least one distinctive phrase extracted from the
+             title (e.g. text highlighted with *, ", [], () — like *ANARC 2*).
+          b. The post text contains at least one creator name variant.
+          c. The post text contains at least one of the distinctive phrases.
+        This tier is deliberately narrow — it requires BOTH the creator AND a
+        distinctive product/event name to be present.  It catches screenshot posts
+        and reaction threads that discuss the video without linking its URL.
+        Score: 0.90 | Tag: "phrase_match"
+
+    Tier 3 — Strict title word coverage  (score 0.80–0.95, tag "title_match")
+        Accepted ONLY when ALL of the following are true:
+          a. The post text contains at least one creator name variant.
+          b. ≥ 60 % of the video's distinctive title words appear in the text,
+             with an absolute minimum of 3 matched words.
+             This prevents cross-video collisions: a post about a DIFFERENT video
+             by the same creator that only shares a couple of words is rejected.
+          c. The video must have ≥ 3 distinctive title words for this tier.
+             (Guard lowered from 4 because Tier 2 now handles phrase-rich short titles.)
+        Score: 0.80 base + 0.05 per word beyond the minimum 3, capped at 0.95.
+
+    Anything else → rejected (False, 0.0, "none").
+
+    Returns (is_match: bool, confidence_score: float, match_type: str)
+    """
+    text_lower = post_text.lower()
+
+    # ── Tier 1: Explicit URL / video ID ────────────────────────────────────
+    if any(pat.lower() in text_lower for pat in fingerprint["url_patterns"]):
+        return True, 1.0, "url"
+
+    creator_variants: List[str] = fingerprint.get("creator_variants", [])
+    if not creator_variants:
+        return False, 0.0, "none"
+
+    creator_present = any(cv in text_lower for cv in creator_variants if cv)
+
+    # Define safe creator variants (full names or tokens >= 5 chars)
+    # Short tokens like "tech" (4 chars) are too generic and would produce false positives
+    safe_creator_variants = [
+        cv for cv in creator_variants
+        if ' ' in cv or len(cv) >= 5
+    ]
+    safe_creator_present = bool(safe_creator_variants and any(
+        cv in text_lower for cv in safe_creator_variants if cv
+    ))
+
+    # ── Tier 2: Creator + distinctive phrase ──────────────────────────────
+    # e.g. post mentions "Tech Burner" AND "ANARC 2" — very high precision.
+    distinctive_phrases: List[str] = fingerprint.get("distinctive_phrases", [])
+    if distinctive_phrases and safe_creator_present:
+        for phrase in distinctive_phrases:
+            if phrase.lower() in text_lower:
+                return True, 0.90, "phrase_match"
+
+    # ── Tier 3: Strict title word coverage ───────────────────────────────
+    topic_words: List[str] = fingerprint.get("topic_words", [])
+
+    # Need a meaningful title with at least 3 distinctive words
+    if not safe_creator_present or len(topic_words) < 3:
+        return False, 0.0, "none"
+
+    # Count title words present in the post text
+    matched = [w for w in topic_words if w in text_lower]
+    coverage = len(matched) / len(topic_words)
+
+    # Require >= 60 % title-word coverage AND at least 3 absolute matches
+    if coverage < 0.60 or len(matched) < 3:
+        return False, 0.0, "none"
+
+    # Score: 0.80 base + 0.05 per word beyond the minimum 3 (cap at 0.95)
+    score = min(0.80 + 0.05 * max(0, len(matched) - 3), 0.95)
+    return True, round(score, 3), "title_match"
+
+
 async def _fetch_reddit_video_discussions(
     vid_id: str,
     title: str = "",
     channel_title: str = "",
     tags: Optional[List[str]] = None,
+    yt_published_at: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Search Reddit for discussions of a specific video:
-    1. Exact URL / ID matches across all subreddits.
-    2. Targeted search by creator name + topic keywords if few direct URL posts exist.
-       Strictly validates that candidate posts explicitly reference the creator and topic.
-    Returns list of discussion post dicts with their top comments.
+    Search Reddit live (via PRAW) for discussions about a specific YouTube video.
+
+    Matching strategy — three search tiers, all verified through
+    ``_verify_reddit_post_is_about_video`` before being accepted:
+
+    Tier 1 — Exact URL / video-ID queries against r/all
+        Finds posts that explicitly linked the video.
+        Score: 1.0 | Tag: "url"
+
+    Tier 2 — Creator + distinctive-phrase queries  (runs when < 10 posts found)
+        For each highlighted phrase in the title (e.g. *ANARC 2* → "ANARC 2"),
+        searches Reddit for '"<creator>" "<phrase>"' and '"<creator>" <phrase>'.
+        This catches screenshot/image posts where users discuss the video without
+        ever linking the YouTube URL.
+        Score: 0.90 | Tag: "phrase_match"
+
+    Tier 3 — Quoted video title search  (runs when < 10 posts found)
+        Searches Reddit for the literal video title (quoted), with a truncated
+        fallback for very long titles.
+        Score: 0.80–0.95 | Tag: "title_match"
+
+    Publish-date sanity window:
+        Any post created more than 3 days BEFORE the video was uploaded is excluded.
+        This prevents old posts about a previous product (e.g. ANARC 1) from
+        contaminating results for a new video (e.g. ANARC 2).
+
+    For image / screenshot posts (i.redd.it / i.imgur.com URLs), the top 5
+    comments are fetched and appended to the verification text so the gatekeeper
+    can confirm the creator and product name are discussed in the thread even when
+    they are absent from the post title/body.
+
+    Returns list of dicts with keys: post_id, subreddit, title, selftext, author,
+    score, created_utc, permalink, url, match_type, similarity_score, comments.
     """
     from app.services.external.reddit_client import RedditClient
     reddit_client = RedditClient()
-    tags = tags or []
 
-    def _search_reddit_sync():
-        seen_posts = {}
+    fingerprint = _build_video_fingerprint(vid_id, title, channel_title, tags, yt_published_at)
 
-        # 1. Exact URL / ID queries
+    # Publish-date window: reject posts created > 3 days before the video upload.
+    # 3 days tolerance accounts for pre-launch teasers and time-zone drift.
+    published_ts: Optional[float] = fingerprint.get("published_ts")
+    _BEFORE_VIDEO_GRACE_DAYS = 3
+
+    def _is_within_date_window(post_created_utc: float) -> bool:
+        """Return True if the post timestamp is within acceptable range."""
+        if published_ts is None:
+            return True  # no date info — allow everything
+        earliest_allowed = published_ts - _BEFORE_VIDEO_GRACE_DAYS * 86400
+        return post_created_utc >= earliest_allowed
+
+    # Image-hosting domains whose posts should include top-comment context
+    _IMAGE_HOSTS = ("i.redd.it", "i.imgur.com", "preview.redd.it")
+
+    def _build_post_verification_text(
+        s,  # praw.models.Submission
+        include_comments: bool = False,
+    ) -> str:
+        """Concatenate post URL, selftext, and title (+ optional top comments)."""
+        parts = [
+            getattr(s, 'url', '') or '',
+            getattr(s, 'selftext', '') or '',
+            getattr(s, 'title', '') or '',
+        ]
+        if include_comments:
+            try:
+                s.comments.replace_more(limit=0)
+                for c in s.comments[:10]:
+                    body = getattr(c, 'body', '') or ''
+                    if body.strip() and body.strip() not in {"[deleted]", "[removed]"}:
+                        parts.append(body)
+            except Exception:
+                pass
+        return " ".join(filter(None, parts))
+
+    def _is_image_post(s) -> bool:
+        url = getattr(s, 'url', '') or ''
+        return any(host in url for host in _IMAGE_HOSTS)
+
+    def _try_add_post(
+        s,
+        seen_posts: Dict[str, tuple],
+        *,
+        allow_negative_score: bool = False,
+    ) -> None:
+        """Verify a submission and add it to seen_posts if it passes the gate."""
+        if s.id in seen_posts:
+            return
+        if _SPAM_SUB_RE.search(str(s.subreddit)):
+            return
+        if not allow_negative_score and s.score < 0:
+            return
+        if not _is_within_date_window(s.created_utc):
+            return
+        # For image/screenshot posts also include top comments in verification
+        is_img = _is_image_post(s)
+        post_text = _build_post_verification_text(s, include_comments=is_img)
+        is_match, score, tag = _verify_reddit_post_is_about_video(post_text, fingerprint)
+        if is_match:
+            seen_posts[s.id] = (s, tag, score)
+
+    def _search_reddit_sync() -> List[Dict[str, Any]]:
+        seen_posts: Dict[str, tuple] = {}  # post_id -> (submission, match_type, score)
+
+        # ── Tier 1: Exact URL / ID queries ───────────────────────────────────
         url_queries = [
             f"url:youtu.be/{vid_id}",
             f"url:youtube.com/watch?v={vid_id}",
@@ -256,89 +609,100 @@ async def _fetch_reddit_video_discussions(
         ]
         for q in url_queries:
             try:
-                submissions = list(reddit_client._reddit.subreddit("all").search(query=q, sort="relevance", limit=15))
-                for s in submissions:
-                    if s.id not in seen_posts:
-                        post_text = ((getattr(s, 'url', '') or '') + ' ' + (getattr(s, 'selftext', '') or '') + ' ' + (getattr(s, 'title', '') or ''))
-                        if vid_id in post_text:
-                            seen_posts[s.id] = (s, "url", 1.0)
+                for s in reddit_client._reddit.subreddit("all").search(
+                    query=q, sort="relevance", limit=15
+                ):
+                    _try_add_post(s, seen_posts, allow_negative_score=True)
             except Exception:
                 pass
 
-        # 2. Targeted creator + topic search if few direct URL posts exist
-        if len(seen_posts) < 5 and channel_title:
-            clean_creator = re.sub(r'(official|channel|tv|hd|yt|hindi|english)', '', channel_title, flags=re.I).strip().lower()
-            creator_variants = [clean_creator]
-            if ' ' in clean_creator:
-                creator_variants.extend([p for p in clean_creator.split() if len(p) >= 3])
-            for t in tags:
-                t_clean = t.strip().lower()
-                if clean_creator in t_clean and t_clean != clean_creator:
-                    creator_variants.append(t_clean)
+        # ── Tier 2: Creator + distinctive-phrase queries ──────────────────────
+        # e.g. searches '"Tech Burner" "ANARC 2"' and '"Tech Burner" ANARC 2'
+        # Catches screenshot posts and reaction threads that don't include a URL.
+        distinctive_phrases: List[str] = fingerprint.get("distinctive_phrases", [])
+        creator_variants: List[str] = fingerprint.get("creator_variants", [])
+        safe_creator_variants = [
+            cv for cv in creator_variants
+            if ' ' in cv or len(cv) >= 5
+        ]
+        # Use channel_title as primary, but also include safe aliases
+        query_creators = [channel_title.strip()] if channel_title else []
+        query_creators.extend([cv for cv in safe_creator_variants if cv.lower() != channel_title.lower().strip()])
+        # Cap at 2 creator terms to prevent query explosion
+        query_creators = query_creators[:2]
 
-            # Filter stopwords to find core topic words from video title
-            stopwords = {
-                'how', 'much', 'do', 'you', 'really', 'need', 'in', 'to', 'the', 'a', 'an', 'is', 'are',
-                'for', 'of', 'and', 'or', 'on', 'at', 'this', 'that', 'with', 'from', 'what', 'your',
-                'video', 'about', 'why', 'can', 'will', 'just', 'best', 'top', 'new', 'vs',
-            }
-            raw_words = re.findall(r'[a-zA-Z]{3,}', title.lower())
-            topic_words = [w for w in raw_words if w not in stopwords]
+        if distinctive_phrases and query_creators and len(seen_posts) < 10:
+            phrase_queries: List[str] = []
+            for phrase in distinctive_phrases[:3]:  # cap at 3 phrases
+                for creator_term in query_creators:
+                    # Quoted phrase (exact)
+                    phrase_queries.append(f'"{creator_term}" "{phrase}"')
+                    # Unquoted phrase (broader)
+                    phrase_queries.append(f'"{creator_term}" {phrase}')
+            # De-duplicate
+            phrase_queries = list(dict.fromkeys(phrase_queries))
 
-            # Construct targeted creator + topic queries
-            topic_queries = []
-            for tw in topic_words[:3]:
-                topic_queries.append(f'"{clean_creator}" {tw}')
-            for t in tags[:3]:
-                if t.lower() != clean_creator and len(t) > 3:
-                    topic_queries.append(f'"{clean_creator}" "{t}"')
-
-            # Exclude known automated/spam subreddits
-            spam_sub_patterns = re.compile(r'(autonewspaper|bot|moderator|spam|promos)', re.I)
-
-            for q in topic_queries[:5]:
+            for q in phrase_queries:
+                if len(seen_posts) >= 10:
+                    break
                 try:
-                    submissions = list(reddit_client._reddit.subreddit("all").search(query=q, sort="relevance", limit=10))
-                    for s in submissions:
-                        sub_name = str(s.subreddit)
-                        if spam_sub_patterns.search(sub_name) or s.score < 0:
-                            continue
-                        if s.id in seen_posts:
-                            continue
-
-                        post_text = ((getattr(s, 'url', '') or '') + ' ' + (getattr(s, 'selftext', '') or '') + ' ' + (getattr(s, 'title', '') or '')).lower()
-                        # Strict validation: MUST mention creator variant AND at least one topic word
-                        has_creator = any(cv in post_text for cv in creator_variants)
-                        matching_topics = [tw for tw in topic_words if tw in post_text]
-                        if has_creator and matching_topics:
-                            seen_posts[s.id] = (s, "topic", 0.85)
+                    for s in reddit_client._reddit.subreddit("all").search(
+                        query=q, sort="relevance", limit=15
+                    ):
+                        _try_add_post(s, seen_posts)
                 except Exception:
                     pass
 
-        # 3. Extract top comments and post threads
-        results = []
+        # ── Tier 3: Quoted video title search ────────────────────────────────
+        # Searches Reddit for the actual video title (quoted), catching posts
+        # that discuss the video by name without linking it.
+        title_raw: str = fingerprint.get("title_raw", "")
+        if title_raw and len(seen_posts) < 10:
+            title_queries: List[str] = [f'"{title_raw}"']
+
+            # Fallback: if the title is very long, also try a truncated version
+            # of the first 60 chars to account for Reddit's search tokenisation
+            if len(title_raw) > 60:
+                truncated = title_raw[:60].rsplit(" ", 1)[0]  # cut at word boundary
+                if len(truncated) >= 20:
+                    title_queries.append(f'"{truncated}"')
+
+            for q in title_queries:
+                if len(seen_posts) >= 10:
+                    break
+                try:
+                    for s in reddit_client._reddit.subreddit("all").search(
+                        query=q, sort="relevance", limit=15
+                    ):
+                        _try_add_post(s, seen_posts)
+                except Exception:
+                    pass
+
+        # ── Extract top comments from each matched post ──────────────────────
+        results: List[Dict[str, Any]] = []
         for post, match_type, sim_score in seen_posts.values():
             try:
-                post.comment_sort = "top"
                 post.comments.replace_more(limit=0)
-                top_comments = []
+                top_comments: List[Dict[str, Any]] = []
                 for c in post.comments[:10]:
-                    if hasattr(c, "body") and c.body:
-                        body_strip = c.body.strip()
-                        author_name = str(c.author) if c.author else "[deleted]"
-                        # Filter bot/deleted comments
-                        if author_name.lower() in {"automoderator", "[deleted]"} or body_strip in {"[deleted]", "[removed]"}:
-                            continue
-                        if len(body_strip) < 5:
-                            continue
-                        top_comments.append({
-                            "id": c.id,
-                            "author": author_name,
-                            "body": body_strip,
-                            "score": c.score,
-                            "created_utc": c.created_utc,
-                            "permalink": f"https://reddit.com{c.permalink}",
-                        })
+                    if not hasattr(c, "body") or not c.body:
+                        continue
+                    body_strip = c.body.strip()
+                    author_name = str(c.author) if c.author else "[deleted]"
+                    if author_name.lower() in {"automoderator", "[deleted]"}:
+                        continue
+                    if body_strip in {"[deleted]", "[removed]"}:
+                        continue
+                    if len(body_strip) < 5:
+                        continue
+                    top_comments.append({
+                        "id": c.id,
+                        "author": author_name,
+                        "body": body_strip,
+                        "score": c.score,
+                        "created_utc": c.created_utc,
+                        "permalink": f"https://reddit.com{c.permalink}",
+                    })
                 results.append({
                     "post_id": post.id,
                     "subreddit": str(post.subreddit),
@@ -582,16 +946,29 @@ async def get_shared_videos(
     }
 
     # 6. Fetch YouTube comments sentiment for cached videos
+    # NOTE: YouTube comments are stored with parent_id=channel_id and the
+    # video in video_id — so match on video_id (parent_id only as a legacy
+    # fallback for docs that lack video_id).
     yt_comments_cursor = comments_coll.find(
-        {"platform": "youtube", "parent_id": {"$in": all_video_ids}},
-        {"_id": 0, "parent_id": 1, "sentiment_label": 1},
+        {
+            "platform": "youtube",
+            "$or": [{"video_id": {"$in": all_video_ids}}, {"parent_id": {"$in": all_video_ids}}],
+        },
+        {"_id": 0, "video_id": 1, "parent_id": 1, "sentiment_label": 1},
     )
     yt_comments_docs = await yt_comments_cursor.to_list(length=1000)
     yt_comments_by_vid: Dict[str, List[str]] = {}
+    _vid_set = set(all_video_ids)
     for cd in yt_comments_docs:
-        vid = cd.get("parent_id")
         lbl = cd.get("sentiment_label")
-        if vid and lbl:
+        if not lbl:
+            continue
+        vid = cd.get("video_id") or None
+        if vid not in _vid_set:
+            # Legacy doc without video_id whose parent_id happens to be a video ID
+            legacy_parent = cd.get("parent_id")
+            vid = legacy_parent if legacy_parent in _vid_set else None
+        if vid:
             yt_comments_by_vid.setdefault(vid, []).append(lbl)
 
     # 7. Process sentiment service for any Reddit comments that haven't been labeled yet
@@ -708,37 +1085,36 @@ async def get_shared_videos(
         elif first_shared_dt:
             propagation_speed = "Recent Community Discovery"
 
-        # Sentiment breakdown for both platforms
+        # Sentiment breakdown for both platforms — measured comments only.
+        # No like-ratio heuristic: without YouTube comments for this video we
+        # return an empty breakdown so the dashboard shows "insufficient data"
+        # instead of fabricated numbers.
         rd_sentiment = _compute_sentiment_breakdown(reddit_sentiments)
 
-        # YouTube sentiment from comments or inferred from like ratios
         yt_labels = yt_comments_by_vid.get(vid_id, [])
-        if yt_labels:
-            yt_sentiment = _compute_sentiment_breakdown(yt_labels)
-        elif views and likes:
-            # High-fidelity heuristic based on like/view engagement
-            like_ratio = likes / max(1, views)
-            if like_ratio > 0.04:
-                yt_pos, yt_neu, yt_neg = 0.85, 0.10, 0.05
-            elif like_ratio > 0.015:
-                yt_pos, yt_neu, yt_neg = 0.70, 0.20, 0.10
-            else:
-                yt_pos, yt_neu, yt_neg = 0.50, 0.35, 0.15
-            yt_sentiment = PlatformSentimentBreakdown(
-                positive=yt_pos,
-                neutral=yt_neu,
-                negative=yt_neg,
-                dominant_label="positive" if yt_pos > 0.5 else "neutral",
-                sample_size=max(1, int(likes / 10)),
-            )
-        else:
-            yt_sentiment = PlatformSentimentBreakdown(
-                positive=0.65, neutral=0.25, negative=0.10, dominant_label="positive", sample_size=10
-            )
+        yt_sentiment = (
+            _compute_sentiment_breakdown(yt_labels) if yt_labels else _empty_breakdown()
+        )
 
-        # Sentiment disparity note
-        gap = round(yt_sentiment.positive - rd_sentiment.positive, 2)
-        if gap >= 0.20:
+        # Sentiment disparity note — only meaningful when both sides measured.
+        gap = _sentiment_gap(yt_sentiment, rd_sentiment)
+        if not _has_samples(yt_sentiment) or not _has_samples(rd_sentiment):
+            if _has_samples(rd_sentiment):
+                disparity_note = (
+                    f"Reddit discussion sentiment is {int(rd_sentiment.positive * 100)}% positive "
+                    f"({rd_sentiment.sample_size} comments analyzed). "
+                    "No YouTube comments for this video have been ingested yet — "
+                    "analyze the video above for a full YouTube-vs-Reddit comparison."
+                )
+            elif _has_samples(yt_sentiment):
+                disparity_note = (
+                    f"YouTube audience sentiment is {int(yt_sentiment.positive * 100)}% positive "
+                    f"({yt_sentiment.sample_size} comments analyzed). "
+                    "No Reddit discussions found for this video yet."
+                )
+            else:
+                disparity_note = "No sentiment comments found for this video yet."
+        elif gap >= 0.20:
             disparity_note = f"YouTube audience response is {int(gap * 100)}% more positive than the Reddit discussion."
         elif gap <= -0.20:
             disparity_note = f"Reddit discussion is {int(abs(gap) * 100)}% more positive than YouTube reception."
@@ -894,15 +1270,29 @@ async def get_video_engagement(
 
     canonical_yt_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-    # 2. Fetch Reddit discussions: search local MongoDB AND search the entire Reddit platform live via PRAW
-    from app.services.external.reddit_client import RedditClient
+    # 2. Fetch Reddit discussions: search local MongoDB AND search Reddit live via PRAW
+    # Matching uses two tiers:
+    #   Tier 1 (url)        — post body explicitly contains this video's URL or bare ID.
+    #   Tier 2 (contextual) — post mentions the creator by name AND ≥ 2 distinctive title
+    #                         keywords, but does NOT contain the URL.  This captures
+    #                         discussions that reference the video by content rather than
+    #                         by link, while still being strictly tied to THIS video.
 
     matched_discussions: List[Dict[str, Any]] = []
-    seen_discussion_ids = set()
+    seen_discussion_ids: set = set()
 
     scan_limit = comment_scan_limit if isinstance(comment_scan_limit, int) else 2000
 
-    # 2A. Search local MongoDB comments
+    # Build the video fingerprint once — reused for all verification calls
+    video_fp = _build_video_fingerprint(
+        vid_id=vid_id,
+        title=title or "",
+        channel_title=channel_title or "",
+        tags=yt_tags or [],
+        yt_published_at=yt_published_at,
+    )
+
+    # 2A. Search local MongoDB cached Reddit comments
     reddit_cursor = (
         comments_coll
         .find(
@@ -926,42 +1316,30 @@ async def get_video_engagement(
     )
     all_reddit_docs = await reddit_cursor.to_list(length=scan_limit)
 
-    # Build all YouTube URL patterns that reference this video ID
-    _yt_url_patterns = [
-        vid_id,                                        # bare ID anywhere in text
-        f"youtu.be/{vid_id}",                          # short URL
-        f"watch?v={vid_id}",                           # standard URL
-        f"youtube.com/watch?v={vid_id}",               # full standard URL
-        f"youtube.com/shorts/{vid_id}",                # shorts
-        f"youtube.com/embed/{vid_id}",                 # embed
-    ]
-
     for doc in all_reddit_docs:
-        body = doc.get("body", "")
-        # Match if any known URL pattern for this video appears in the body
-        if any(pat in body for pat in _yt_url_patterns) or bool(_YT_URL_RE.search(body) and vid_id in _YT_URL_RE.findall(body)):
-            d_id = doc.get("platform_id")
-            if d_id and d_id not in seen_discussion_ids:
-                seen_discussion_ids.add(d_id)
-                d_copy = dict(doc)
-                d_copy["match_type"] = "url"
-                d_copy["similarity_score"] = 1.0
-                matched_discussions.append(d_copy)
+        body = doc.get("body") or ""
+        if not body:
+            continue
+        d_id = doc.get("platform_id")
+        if not d_id or d_id in seen_discussion_ids:
+            continue
 
-    # NOTE: Semantic similarity matching is intentionally DISABLED for the
-    # video-engagement endpoint. It produced false positives: a video titled
-    # "How Much Salary Do You Need in India?" would semantically match any
-    # Reddit comment about money/salary/India, even from completely unrelated
-    # subreddits.  Only exact URL-based references are reliable for verifying
-    # that a Reddit discussion actually references THIS specific video.
+        is_match, score, tag = _verify_reddit_post_is_about_video(body, video_fp)
+        if is_match:
+            seen_discussion_ids.add(d_id)
+            d_copy = dict(doc)
+            d_copy["match_type"] = tag
+            d_copy["similarity_score"] = score
+            matched_discussions.append(d_copy)
 
-    # 2B. Live Reddit search: exact URLs first, then creator+topic discussions
+    # 2B. Live Reddit search via PRAW (all three tiers inside _fetch_reddit_video_discussions)
     try:
         live_reddit_posts = await _fetch_reddit_video_discussions(
             vid_id=vid_id,
             title=title or "",
             channel_title=channel_title or "",
             tags=yt_tags or [],
+            yt_published_at=yt_published_at,
         )
 
         for p in live_reddit_posts:
@@ -989,7 +1367,7 @@ async def get_video_engagement(
                         "sentiment_score": None,
                     })
 
-            # Also include the post thread itself as a discussion
+            # Also include the post thread itself as a discussion item
             p_id = p["post_id"]
             if p_id not in seen_discussion_ids:
                 seen_discussion_ids.add(p_id)
@@ -1012,6 +1390,49 @@ async def get_video_engagement(
     except Exception:
         pass
 
+    # 2C. Persist verified live discussions so DB coverage grows with usage.
+    # Live PRAW results arrive without sentiment labels; insert-only writes
+    # ($setOnInsert) mean repeat queries hit Mongo instead of re-burning
+    # Reddit/YouTube quota — and existing docs (with sentiment labels) are
+    # never clobbered.
+    if matched_discussions:
+        try:
+            from pymongo import UpdateOne as _UpdateOne
+
+            _persist_ops = []
+            _now = datetime.now(timezone.utc)
+            for _d in matched_discussions:
+                _pid = _d.get("platform_id")
+                if not _pid or not _d.get("body"):
+                    continue
+                _persist_ops.append(
+                    _UpdateOne(
+                        {"platform": "reddit", "platform_id": _pid},
+                        {
+                            "$setOnInsert": {
+                                "platform": "reddit",
+                                "platform_id": _pid,
+                                "parent_id": str(_d.get("parent_id") or "").lower(),
+                                "post_id": _d.get("post_id") or _pid,
+                                "author": _d.get("author") or "[deleted]",
+                                "body": _d.get("body") or "",
+                                "score": int(_d.get("score") or 0),
+                                "published_at": _d.get("published_at"),
+                                "permalink": _d.get("permalink"),
+                                "match_type": _d.get("match_type"),
+                                "similarity_score": _d.get("similarity_score"),
+                                "sentiment_processed": False,
+                                "ingested_at": _now,
+                            }
+                        },
+                        upsert=True,
+                    )
+                )
+            if _persist_ops:
+                await comments_coll.bulk_write(_persist_ops, ordered=False)
+        except Exception:
+            pass
+
     # 3. Analyze Reddit discussions
     reddit_discussions: List[RedditDiscussionItem] = []
     reddit_sentiments: List[str] = []
@@ -1021,14 +1442,35 @@ async def get_video_engagement(
     reddit_upvotes_total = 0
     discussion_bodies: List[str] = []
 
-    # Check for unlabelled sentiment
-    unlabeled_bodies = [d.get("body", "") for d in matched_discussions if not d.get("sentiment_label") and d.get("body")]
+    # Run sentiment classification on ALL unlabelled discussion bodies in one batch.
+    # This must happen AFTER matched_discussions is fully assembled (MongoDB + live PRAW),
+    # so live PRAW comments (which always arrive without a sentiment_label) get real
+    # classification instead of silently defaulting to "neutral".
+    unlabeled_bodies = [
+        d.get("body", "")
+        for d in matched_discussions
+        if not d.get("sentiment_label") and d.get("body")
+    ]
     quick_sentiment_map: Dict[str, tuple[str, float]] = {}
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
-            batch_res = await _asyncio.to_thread(svc.analyze_batch, unlabeled_bodies[:100])
-            for text, res in zip(unlabeled_bodies[:100], batch_res):
+            # Limit to 150 texts per batch to keep latency reasonable
+            batch_input = unlabeled_bodies[:150]
+            batch_res = await _asyncio.to_thread(svc.analyze_batch, batch_input)
+            for text, res in zip(batch_input, batch_res):
+                quick_sentiment_map[text] = (res.label.value, res.score)
+        except Exception:
+            pass
+
+    # Second batch for bodies beyond the 150-item cap — still off the event
+    # loop via to_thread (never run blocking single inference inline).
+    _overflow_bodies = [t for t in unlabeled_bodies[150:250] if t not in quick_sentiment_map]
+    if _overflow_bodies:
+        try:
+            svc = _get_sentiment_svc()
+            _overflow_res = await _asyncio.to_thread(svc.analyze_batch, _overflow_bodies)
+            for text, res in zip(_overflow_bodies, _overflow_res):
                 quick_sentiment_map[text] = (res.label.value, res.score)
         except Exception:
             pass
@@ -1052,12 +1494,14 @@ async def get_video_engagement(
         label = r_doc.get("sentiment_label")
         s_score = r_doc.get("sentiment_score")
         if not label:
-            mapped = quick_sentiment_map.get(r_doc.get("body", ""))
+            body_text = r_doc.get("body", "")
+            mapped = quick_sentiment_map.get(body_text)
             if mapped:
                 label, s_score = mapped
             else:
-                label = "neutral"
-                s_score = 0.5
+                # Only reachable past the 250-item classification cap or for
+                # blank bodies — default honestly instead of blocking inference.
+                label, s_score = "neutral", 0.5
         reddit_sentiments.append(label)
         if r_doc.get("body"):
             discussion_bodies.append(r_doc["body"])
@@ -1133,8 +1577,8 @@ async def get_video_engagement(
         rd_sentiment = _compute_sentiment_breakdown(reddit_sentiments)
 
     disparity_note: Optional[str] = None
-    if yt_sentiment and rd_sentiment and yt_sentiment.sample_size > 0 and rd_sentiment.sample_size > 0:
-        gap = round(yt_sentiment.positive - rd_sentiment.positive, 2)
+    gap = _sentiment_gap(yt_sentiment, rd_sentiment)
+    if _has_samples(yt_sentiment) and _has_samples(rd_sentiment):
         subs_text = f" across {len(subreddits_set)} subreddits" if subreddits_set else ""
         if gap > 0.15:
             disparity_note = (
@@ -1154,7 +1598,13 @@ async def get_video_engagement(
                 f"and Reddit ({int(rd_sentiment.positive*100)}% pos{subs_text})."
             )
     elif yt_sentiment and yt_sentiment.sample_size > 0:
-        disparity_note = f"YouTube audience sentiment is {int(yt_sentiment.positive*100)}% positive ({yt_sentiment.sample_size} comments). No Reddit community discussions found referencing this video yet."
+        disparity_note = (
+            f"YouTube audience sentiment is {int(yt_sentiment.positive*100)}% positive "
+            f"({yt_sentiment.sample_size} comments). "
+            "No Reddit discussions were found that reference this specific video "
+            "(checked by video URL, bare ID, and exact title). "
+            "The metrics above reflect real data — 0 Reddit discussions, 0 subreddits."
+        )
     elif rd_sentiment and rd_sentiment.sample_size > 0:
         disparity_note = f"Reddit discussion sentiment is {int(rd_sentiment.positive*100)}% positive ({rd_sentiment.sample_size} comments analyzed)."
 
@@ -1376,11 +1826,8 @@ async def get_sentiment_comparison(
 
     yt_sentiment = _compute_sentiment_breakdown(yt_labels)
 
-    # Calculate gap (positive sentiment differential)
-    if yt_sentiment.sample_size > 0 and rd_sentiment.sample_size > 0:
-        gap = round(yt_sentiment.positive - rd_sentiment.positive, 3)
-    else:
-        gap = 0.0
+    # Single shared gap rule (0.0 unless both sides measured, 2-decimal rounding).
+    gap = _sentiment_gap(yt_sentiment, rd_sentiment)
 
     if yt_sentiment.sample_size == 0 and rd_sentiment.sample_size == 0:
         summary = "No sentiment comments found for this query yet. Try scanning an active subreddit or video."
@@ -1532,14 +1979,10 @@ async def get_top_videos_for_topic(
             views = int(stats.get("viewCount", 0) or 0)
             likes = int(stats.get("likeCount", 0) or 0)
 
-            # Inferred sentiment
-            like_ratio = likes / max(1, views)
-            if like_ratio > 0.04:
-                yt_pos, yt_neu, yt_neg = 0.80, 0.15, 0.05
-            elif like_ratio > 0.015:
-                yt_pos, yt_neu, yt_neg = 0.70, 0.20, 0.10
-            else:
-                yt_pos, yt_neu, yt_neg = 0.55, 0.30, 0.15
+            # No measured comments exist for live-search results (they were
+            # never ingested), so report an honest empty breakdown instead of
+            # inferring sentiment from like ratios. Analyze the video above
+            # for a real YouTube-vs-Reddit comparison.
 
             results.append(
                 SharedVideoItem(
@@ -1556,13 +1999,7 @@ async def get_top_videos_for_topic(
                     youtube_channel_title=snippet.get("channelTitle", ""),
                     youtube_published_at=snippet.get("publishedAt"),
                     youtube_tags=snippet.get("tags", [])[:5],
-                    youtube_sentiment=PlatformSentimentBreakdown(
-                        positive=yt_pos,
-                        neutral=yt_neu,
-                        negative=yt_neg,
-                        dominant_label="positive" if yt_pos >= 0.5 else "neutral",
-                        sample_size=max(1, int(likes / 10)),
-                    ),
+                    youtube_sentiment=_empty_breakdown(),
                     topics=snippet.get("tags", [])[:4],
                 )
             )

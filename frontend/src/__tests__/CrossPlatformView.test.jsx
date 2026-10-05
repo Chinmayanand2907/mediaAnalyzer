@@ -66,9 +66,13 @@ const mockSummary = {
   },
 };
 
+import { clearAnalyticsCache } from '../hooks/useAnalytics';
+
 describe('CrossPlatformView Component', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearAnalyticsCache();
+    localStorage.clear();
     apiClient.fetchRedditSubreddits.mockResolvedValue([{ subreddit_name: 'gaming', display_name: 'Gaming' }]);
     apiClient.fetchSharedVideos.mockResolvedValue(mockSharedVideos);
     apiClient.fetchTopVideos.mockResolvedValue([]);
@@ -77,15 +81,34 @@ describe('CrossPlatformView Component', () => {
     apiClient.fetchVideoCrossPlatformEngagement.mockResolvedValue(null);
   });
 
+  // Helper: switch to Explore Subreddits mode and scan r/gaming so the
+  // subreddit-gated hooks (shared videos, sentiment) actually fetch.
+  async function scanGamingSubreddit(user) {
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Explore Subreddits/i }));
+    });
+    await act(async () => {
+      await user.type(screen.getByPlaceholderText(/gaming, askreddit/i), 'gaming');
+    });
+    await act(async () => {
+      await user.click(screen.getByRole('button', { name: /Scan/i }));
+    });
+    expect(await screen.findByText(/YouTube Videos Shared in r/i)).toBeInTheDocument();
+  }
+
   it('renders updated KPI cards and the linked video table', async () => {
+    const user = userEvent.setup();
     render(<CrossPlatformView />);
 
     expect(await screen.findByText('Cross-Platform Analysis')).toBeInTheDocument();
+    // Video mode (default) with no video entered: KPI cards render placeholders
     expect(screen.getByText('Subreddits Discussing')).toBeInTheDocument();
     expect(screen.getByText('Reddit Discussions')).toBeInTheDocument();
     expect(screen.getByText('YouTube Reach')).toBeInTheDocument();
     expect(screen.getByText('Viral Latency')).toBeInTheDocument();
 
+    // Linked-video table lives in Explore Subreddits mode after a scan
+    await scanGamingSubreddit(user);
     expect((await screen.findAllByText(/Never Gonna Give You Up/i)).length).toBeGreaterThan(0);
     expect(screen.getAllByText('Rick Astley').length).toBeGreaterThan(0);
   });
@@ -101,6 +124,8 @@ describe('CrossPlatformView Component', () => {
     const user = userEvent.setup();
     render(<CrossPlatformView />);
 
+    // Table rows only render in Explore Subreddits mode after a scan
+    await scanGamingSubreddit(user);
     const toggleBtn = await screen.findByRole('button', { name: /2/i });
     await act(async () => {
       await user.click(toggleBtn);
