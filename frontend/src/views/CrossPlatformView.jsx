@@ -282,30 +282,35 @@ export default function CrossPlatformView() {
         ? shared.reduce((acc, v) => acc + (v.reddit_discussions?.length || 0), 0)
         : (summaryData?.correlation_summary?.total_discussions_linked || 0));
 
-  const redditDiscussionsSub = currentVideoData?.reddit_total_upvotes
-    ? `${fmt(currentVideoData.reddit_total_upvotes)} total upvotes across Reddit`
-    : 'Comments citing this video';
+  // Card 2 — Reddit Comments: shows total comment count (bold) + total upvotes
+  const redditTotalComments = currentVideoData?.reddit_total_comments ?? null;
+  const redditTotalUpvotes  = currentVideoData?.reddit_total_upvotes  ?? null;
+  const redditDiscussionsValue = activeVideo
+    ? (redditTotalComments != null ? fmt(redditTotalComments) : '—')
+    : '—';
+  const redditDiscussionsSub = activeVideo
+    ? (redditTotalUpvotes != null
+        ? `${fmt(redditTotalUpvotes)} total upvotes across Reddit`
+        : 'Enter a video ID or URL above')
+    : 'Enter a video ID or URL above';
 
-  // P2: Separate YouTube Reach (card 3) and Viral Latency (card 4) — always visible
-  const hasVideoViews = currentVideoData?.youtube_views != null;
+  // Card 4 — Reddit Posts (distinct threads posted about this video)
+  const redditPostsCount = currentVideoData?.reddit_posts_count ?? null;
+  const card4Value = activeVideo
+    ? (redditPostsCount != null ? fmt(redditPostsCount) : '—')
+    : '—';
+  const card4Sub = activeVideo
+    ? (redditPostsCount != null
+        ? `Distinct Reddit thread${redditPostsCount !== 1 ? 's' : ''} about this video`
+        : 'No Reddit posts found')
+    : 'Enter a video ID or URL above';
 
   // Card 3 — YouTube Reach
+  const hasVideoViews = currentVideoData?.youtube_views != null;
   const card3Value = hasVideoViews ? fmt(currentVideoData.youtube_views) : '—';
   const card3Sub   = hasVideoViews
     ? `${fmt(currentVideoData.youtube_likes)} likes · ${currentVideoData.propagation_speed || 'Active'}`
     : 'Select a video above to see reach';
-
-  // Card 4 — Viral Latency
-  const rawPropHours = currentVideoData?.propagation_delay_hours
-    ?? summaryData?.correlation_summary?.avg_propagation_lag_hours;
-  const card4Value = rawPropHours != null
-    ? `${Number(rawPropHours).toFixed(rawPropHours < 10 ? 1 : 0)} hrs`
-    : '—';
-  const card4Sub = currentVideoData?.propagation_delay_hours != null
-    ? 'YouTube → Reddit for this video'
-    : rawPropHours != null
-      ? 'Avg across all tracked videos'
-      : 'No propagation data yet';
 
   const availableSubs = subreddits?.length > 0
     ? Array.from(new Set([...subreddits.map(s => s.subreddit_name), ...PRESET_SUBREDDITS]))
@@ -723,9 +728,9 @@ export default function CrossPlatformView() {
             loading={videoLoading}
           />
           <StatCard
-            title="Reddit Discussions"
-            value={activeVideo ? totalRedditDiscussions : '—'}
-            sub={activeVideo ? redditDiscussionsSub : 'Enter a video ID or URL above'}
+            title="Reddit Comments"
+            value={redditDiscussionsValue}
+            sub={redditDiscussionsSub}
             icon={MessageSquare}
             accent="var(--rd-primary)"
             loading={videoLoading}
@@ -739,12 +744,12 @@ export default function CrossPlatformView() {
             loading={videoLoading}
           />
           <StatCard
-            title="Viral Latency"
+            title="Reddit Posts"
             value={activeVideo ? card4Value : '—'}
             sub={activeVideo ? card4Sub : 'Enter a video ID or URL above'}
-            icon={Zap}
+            icon={Share2}
             accent="#a78bfa"
-            loading={videoLoading || summaryLoading}
+            loading={videoLoading}
           />
         </div>
       )}
@@ -762,11 +767,11 @@ export default function CrossPlatformView() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <MessageSquare size={16} color="var(--rd-primary)" />
                 <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-                  Reddit Discussions Found Across All Subreddits ({videoEngagement.discussions.length})
+                  Top Reddit Discussions ({videoEngagement.discussions.length} shown from {videoEngagement.reddit_posts_count ?? videoEngagement.subreddits_count ?? ''} post{videoEngagement.reddit_posts_count !== 1 ? 's' : ''})
                 </h3>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
-                Discussions and comments referencing this video across communities:{' '}
+                Highest-scoring comments from Reddit threads about this video across:{' '}
                 <strong style={{ color: 'var(--cx-primary)' }}>
                   {videoEngagement.subreddits_list?.map(s => `r/${s}`).join(', ') || 'Various Subreddits'}
                 </strong>

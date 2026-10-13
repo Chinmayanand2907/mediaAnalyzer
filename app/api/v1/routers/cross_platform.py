@@ -352,6 +352,14 @@ def _build_video_fingerprint(
     # Many YouTubers emphasise the key product/event name using *, ", [], or ().
     # e.g. "Our New Smartwatch is Here ! *ANARC 2*" → ["ANARC 2"]
     # These are high-signal terms perfect for a creator+phrase Reddit query.
+    # Generic phrases frequently placed in titles/brackets that should not be queried as distinctive phrases
+    _GENERIC_SEGMENTS = {
+        'official', 'music', 'video', 'audio', 'lyrics', 'ft', 'feat',
+        'full', 'hd', 'full hd', '4k', 'new', 'latest', 'vlog', 'shorts',
+        'official video', 'official music video', 'official audio', 'lyric video',
+        'official teaser trailer', 'official trailer', 'teaser trailer', 'trailer',
+    }
+
     raw_brackets = re.findall(
         r'[\*\"\[\(]([^\*\"\[\]\(\)]{2,40})[\*\"\]\)]',
         title,
@@ -359,8 +367,27 @@ def _build_video_fingerprint(
     distinctive_phrases: List[str] = []
     for bp in raw_brackets:
         bp_clean = bp.strip()
-        if len(bp_clean) >= 2:
+        if len(bp_clean) >= 2 and bp_clean.lower() not in _GENERIC_SEGMENTS:
             distinctive_phrases.append(bp_clean)
+
+    # Also extract pipe-separated, dash-separated, colon-separated segments from the title.
+    # We use '\s+-\s+' for ASCII hyphens to avoid breaking compound words (e.g. Anti-Hero, Spider-Man).
+    # e.g. "My First Press Conference | Open Challenge to Modi | Dhruv Rathee"
+    #   → ["My First Press Conference", "Open Challenge to Modi"]
+    # These segments are used in Tier-2 Creator+Phrase queries to find threads
+    # where users discuss the video by subject without linking the URL.
+    _SEGMENT_SPLITTER = re.compile(r'\s*[|–—:]\s*|\s+-\s+')
+    for seg in _SEGMENT_SPLITTER.split(title):
+        # Strip trailing/leading bracket artifacts if any
+        seg_clean = re.sub(r'[\(\[\*].*?[\)\]\*]', '', seg).strip()
+        # Skip the creator name itself as a phrase (it's already in creator_variants)
+        if seg_clean.lower() == channel_title.strip().lower():
+            continue
+        # Skip very short or very long segments and generic terms
+        if 4 <= len(seg_clean) <= 60 and seg_clean.lower() not in _GENERIC_SEGMENTS:
+            if seg_clean not in distinctive_phrases:
+                distinctive_phrases.append(seg_clean)
+
     # De-duplicate while preserving order
     distinctive_phrases = list(dict.fromkeys(distinctive_phrases))
 
@@ -710,6 +737,7 @@ async def _fetch_reddit_video_discussions(
                     "selftext": post.selftext or "",
                     "author": str(post.author) if post.author else "[deleted]",
                     "score": post.score,
+                    "num_comments": getattr(post, 'num_comments', 0),
                     "created_utc": post.created_utc,
                     "permalink": f"https://reddit.com{post.permalink}",
                     "url": getattr(post, 'url', ''),
@@ -1333,6 +1361,10 @@ async def get_video_engagement(
             matched_discussions.append(d_copy)
 
     # 2B. Live Reddit search via PRAW (all three tiers inside _fetch_reddit_video_discussions)
+    # live_post_stats tracks each matched Reddit post thread separately so we can
+    # surface accurate per-post counts (num_comments, score) in the KPIs.
+    live_post_stats: Dict[str, Dict[str, Any]] = {}  # post_id -> {subreddit, score, num_comments}
+
     try:
         live_reddit_posts = await _fetch_reddit_video_discussions(
             vid_id=vid_id,
@@ -1345,8 +1377,17 @@ async def get_video_engagement(
         for p in live_reddit_posts:
             p_match_type = p.get("match_type", "url")
             p_sim_score = p.get("similarity_score", 1.0)
+            p_id = p["post_id"]
 
-            # Add top comments from this post
+            # Track post-level stats (unique per post_id)
+            if p_id not in live_post_stats:
+                live_post_stats[p_id] = {
+                    "subreddit": p["subreddit"],
+                    "score": p["score"],
+                    "num_comments": p.get("num_comments", 0),
+                }
+
+            # Add top comments from this post as discussion items
             for c in p.get("comments", []):
                 c_id = c["id"]
                 if c_id not in seen_discussion_ids:
@@ -1354,7 +1395,7 @@ async def get_video_engagement(
                     pub_iso = datetime.fromtimestamp(c["created_utc"], tz=timezone.utc).isoformat() if c.get("created_utc") else None
                     matched_discussions.append({
                         "platform_id": c_id,
-                        "post_id": p["post_id"],
+                        "post_id": p_id,
                         "parent_id": p["subreddit"],
                         "author": c["author"],
                         "body": c["body"],
@@ -1365,28 +1406,12 @@ async def get_video_engagement(
                         "similarity_score": p_sim_score,
                         "sentiment_label": None,
                         "sentiment_score": None,
+                        "_is_post": False,
                     })
 
-            # Also include the post thread itself as a discussion item
-            p_id = p["post_id"]
-            if p_id not in seen_discussion_ids:
-                seen_discussion_ids.add(p_id)
-                pub_iso = datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat() if p.get("created_utc") else None
-                body_text = p["title"] + (f" - {p['selftext'][:250]}" if p.get("selftext") else "")
-                matched_discussions.append({
-                    "platform_id": p_id,
-                    "post_id": p_id,
-                    "parent_id": p["subreddit"],
-                    "author": p["author"],
-                    "body": body_text,
-                    "score": p["score"],
-                    "published_at": pub_iso,
-                    "permalink": p["permalink"],
-                    "match_type": p_match_type,
-                    "similarity_score": p_sim_score,
-                    "sentiment_label": None,
-                    "sentiment_score": None,
-                })
+            # Do NOT include the post thread itself as a discussion body item
+            # (it inflates comment count stats and the title is not a comment).
+            # Post-level info is tracked in live_post_stats above.
     except Exception:
         pass
 
@@ -1440,7 +1465,29 @@ async def get_video_engagement(
     subreddits_set = set()
     post_ids_set = set()
     reddit_upvotes_total = 0
+    # reddit_total_comments_sum = sum of actual num_comments on each matched Reddit post
+    reddit_total_comments_sum = 0
     discussion_bodies: List[str] = []
+
+    # Collect subreddits and upvotes from live matched posts
+    for p_id, p_stat in live_post_stats.items():
+        sub = (p_stat.get("subreddit") or "").lower()
+        if sub:
+            subreddits_set.add(sub)
+        post_ids_set.add(p_id)
+        reddit_upvotes_total += int(p_stat.get("score") or 0)
+        reddit_total_comments_sum += int(p_stat.get("num_comments") or 0)
+
+    # Also sweep MongoDB matched discussions for subreddits/post IDs from the DB scan
+    for r_doc in matched_discussions:
+        sub = (r_doc.get("parent_id") or "").lower()
+        if sub:
+            subreddits_set.add(sub)
+        p_id = r_doc.get("post_id") or r_doc.get("platform_id") or ""
+        if p_id and p_id not in post_ids_set:
+            # This post was found from MongoDB scan but not from PRAW live search;
+            # we don't have num_comments for it, so skip double-counting upvotes.
+            post_ids_set.add(p_id)
 
     # Run sentiment classification on ALL unlabelled discussion bodies in one batch.
     # This must happen AFTER matched_discussions is fully assembled (MongoDB + live PRAW),
@@ -1476,16 +1523,6 @@ async def get_video_engagement(
             pass
 
     for r_doc in matched_discussions:
-        sub = r_doc.get("parent_id") or ""
-        if sub:
-            subreddits_set.add(sub.lower())
-        p_id = r_doc.get("post_id") or r_doc.get("platform_id") or ""
-        if p_id:
-            post_ids_set.add(p_id)
-
-        score = int(r_doc.get("score") or 0)
-        reddit_upvotes_total += score
-
         pub_str = r_doc.get("published_at")
         pub_dt = _parse_iso_datetime(pub_str)
         if pub_dt:
@@ -1506,6 +1543,10 @@ async def get_video_engagement(
         if r_doc.get("body"):
             discussion_bodies.append(r_doc["body"])
 
+        sub = (r_doc.get("parent_id") or "").lower()
+        p_id = r_doc.get("post_id") or r_doc.get("platform_id") or ""
+        score = int(r_doc.get("score") or 0)
+
         reddit_discussions.append(
             RedditDiscussionItem(
                 discussion_id=r_doc.get("platform_id", ""),
@@ -1522,6 +1563,10 @@ async def get_video_engagement(
                 similarity_score=r_doc.get("similarity_score", 1.0),
             )
         )
+
+    # Sort all discussions by score descending, keep top 10 for the UI card
+    reddit_discussions.sort(key=lambda d: d.score, reverse=True)
+    top_discussions = reddit_discussions[:10]
 
     # 4. Propagation timeline
     first_shared_dt = min(discussion_dates) if discussion_dates else None
@@ -1624,8 +1669,9 @@ async def get_video_engagement(
         subreddits_count=len(subreddits_set),
         subreddits_list=sorted(list(subreddits_set)),
         total_reddit_discussions=len(reddit_discussions),
+        reddit_posts_count=len(post_ids_set),
         reddit_total_upvotes=reddit_upvotes_total,
-        reddit_total_comments=len(reddit_discussions),
+        reddit_total_comments=reddit_total_comments_sum,
         reddit_first_shared_at=first_shared_str,
         reddit_latest_shared_at=latest_shared_str,
         propagation_delay_hours=propagation_delay_hours,
@@ -1633,7 +1679,7 @@ async def get_video_engagement(
         youtube_sentiment=yt_sentiment,
         reddit_sentiment=rd_sentiment,
         sentiment_disparity_note=disparity_note,
-        discussions=reddit_discussions,
+        discussions=top_discussions,
         topics=topics,
     )
 
@@ -1678,7 +1724,7 @@ async def get_sentiment_comparison(
     if vid_id:
         # Match Reddit comments from MongoDB
         rd_cursor = comments_coll.find(
-            {"platform": "reddit", "body": {"": re.escape(vid_id), "off on off off off off off off off off on off on off off off off off on off off off on on off off off off on off off off off off off off off off off off off on off off off off off off off on off on on off off off on off off on off off on off off on off on off off on off on off off off off on off off off on off off on off off off off off off off off on off on off off on off off off off off off off off off off off off on off off off on off on off on on off off off off on on off off on on off on off on on off off off off on on off off on off off off off off on off off on off off on off off off off off off on off off off off on on off on off off off off off on off on off off off off off off off off off off on on off on off off off": "i"}},
+            {"platform": "reddit", "body": {"$regex": re.escape(vid_id), "$options": "i"}},
             {"_id": 0, "sentiment_label": 1, "body": 1},
         ).limit(100)
         rd_docs = await rd_cursor.to_list(length=100)

@@ -187,8 +187,9 @@ class VideoCrossPlatformEngagementResponse(BaseModel):
     subreddits_count: int = Field(0, description="Count of distinct subreddits discussing this video")
     subreddits_list: List[str] = Field(default_factory=list, description="List of distinct subreddits where video was shared")
     total_reddit_discussions: int = Field(0, description="Total Reddit comments/posts citing this video")
-    reddit_total_upvotes: int = Field(0, description="Total upvotes across Reddit discussions")
-    reddit_total_comments: int = Field(0, description="Estimated total comments in threads")
+    reddit_posts_count: int = Field(0, description="Number of distinct Reddit posts (threads) about this video")
+    reddit_total_upvotes: int = Field(0, description="Total upvotes across all Reddit posts discussing this video")
+    reddit_total_comments: int = Field(0, description="Sum of num_comments across all matched Reddit posts")
     reddit_first_shared_at: Optional[str] = None
     reddit_latest_shared_at: Optional[str] = None
     propagation_delay_hours: Optional[float] = None
