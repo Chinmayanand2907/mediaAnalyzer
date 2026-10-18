@@ -234,32 +234,52 @@ def _normalise_engagement(raw: Dict[str, Any], platform: str) -> float:
     return round(min(max(score, 0.0), 100.0), 2)
 
 
-async def _fetch_youtube_video_comments(vid_id: str, max_comments: int = 50) -> List[str]:
-    """Fetch top comments for a specific YouTube video live via YouTube Data API."""
+async def _fetch_youtube_video_comments(vid_id: str, max_comments: int = 200) -> List[str]:
+    """Fetch top comments for a specific YouTube video live via YouTube Data API.
+
+    Supports pagination to fetch up to max_comments comments in batches of 100.
+    Sorted by relevance so the most prominent community comments are classified first.
+    """
     try:
         from app.services.external.youtube_client import YouTubeClient
         yt_client = YouTubeClient()
-        ct_req = yt_client._service.commentThreads().list(
-            part="snippet",
-            videoId=vid_id,
-            maxResults=min(max_comments, 100),
-            order="relevance",
-            textFormat="plainText",
-        )
-        ct_data = await _asyncio.to_thread(ct_req.execute)
-        comments = []
-        for item in ct_data.get("items", []):
-            text = (
-                item.get("snippet", {})
-                .get("topLevelComment", {})
-                .get("snippet", {})
-                .get("textDisplay", "")
+        comments: List[str] = []
+        page_token = None
+
+        while len(comments) < max_comments:
+            remaining = max_comments - len(comments)
+            batch_size = min(remaining, 100)  # YouTube API max per page is 100
+            params: dict = dict(
+                part="snippet",
+                videoId=vid_id,
+                maxResults=batch_size,
+                order="relevance",
+                textFormat="plainText",
             )
-            if text and len(text.strip()) > 5:
-                comments.append(text.strip())
+            if page_token:
+                params["pageToken"] = page_token
+
+            req = yt_client._service.commentThreads().list(**params)
+            ct_data = await _asyncio.to_thread(req.execute)
+
+            for item in ct_data.get("items", []):
+                text = (
+                    item.get("snippet", {})
+                    .get("topLevelComment", {})
+                    .get("snippet", {})
+                    .get("textDisplay", "")
+                )
+                if text and len(text.strip()) > 5:
+                    comments.append(text.strip())
+
+            page_token = ct_data.get("nextPageToken")
+            if not page_token:
+                break  # No more pages available
+
         return comments
     except Exception:
         return []
+
 
 
 # ── Video fingerprint helpers ─────────────────────────────────────────────────
@@ -1502,17 +1522,16 @@ async def get_video_engagement(
     if unlabeled_bodies:
         try:
             svc = _get_sentiment_svc()
-            # Limit to 150 texts per batch to keep latency reasonable
-            batch_input = unlabeled_bodies[:150]
+            # Process up to 500 Reddit bodies in the first batch for a larger Reddit sample.
+            batch_input = unlabeled_bodies[:500]
             batch_res = await _asyncio.to_thread(svc.analyze_batch, batch_input)
             for text, res in zip(batch_input, batch_res):
                 quick_sentiment_map[text] = (res.label.value, res.score)
         except Exception:
             pass
 
-    # Second batch for bodies beyond the 150-item cap — still off the event
-    # loop via to_thread (never run blocking single inference inline).
-    _overflow_bodies = [t for t in unlabeled_bodies[150:250] if t not in quick_sentiment_map]
+    # Overflow batch for bodies 500–750 — still off the event loop via to_thread.
+    _overflow_bodies = [t for t in unlabeled_bodies[500:750] if t not in quick_sentiment_map]
     if _overflow_bodies:
         try:
             svc = _get_sentiment_svc()
@@ -1594,20 +1613,22 @@ async def get_video_engagement(
         propagation_speed = "Community Discovered"
 
     # 5. YouTube sentiment — from MongoDB first, then live YouTube API fallback
+    # Use a large sample (500) to get a statistically meaningful sentiment signal.
     yt_comments_cursor = comments_coll.find(
         {"platform": "youtube", "$or": [{"video_id": vid_id}, {"parent_id": vid_id}]},
         {"_id": 0, "sentiment_label": 1, "body": 1},
     )
-    yt_comments_docs = await yt_comments_cursor.to_list(length=200)
+    yt_comments_docs = await yt_comments_cursor.to_list(length=500)
     yt_sent_labels = [d.get("sentiment_label") for d in yt_comments_docs if d.get("sentiment_label")]
 
-    # If MongoDB has insufficient YouTube comments for this video, fetch live from YouTube API
-    if len(yt_sent_labels) < 5:
-        live_yt_bodies = await _fetch_youtube_video_comments(vid_id, max_comments=50)
+    # If MongoDB has insufficient YouTube comments for this video, fetch live from YouTube API.
+    # YouTube API returns at most 100 per page; fetch up to 200 for a richer signal.
+    if len(yt_sent_labels) < 20:
+        live_yt_bodies = await _fetch_youtube_video_comments(vid_id, max_comments=200)
         if live_yt_bodies:
             try:
                 svc = _get_sentiment_svc()
-                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:50])
+                batch_res = await _asyncio.to_thread(svc.analyze_batch, live_yt_bodies[:200])
                 yt_sent_labels.extend([r.label.value for r in batch_res])
             except Exception:
                 pass
