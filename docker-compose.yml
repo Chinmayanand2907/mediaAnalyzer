@@ -28,8 +28,8 @@ x-backend-env: &backend-env
   REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID}
   REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET}
   REDDIT_USER_AGENT: ${REDDIT_USER_AGENT:-EngageLens/3.0}
-  GEMINI_API_KEY: ${GEMINI_API_KEY}
-  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash-lite}
+  RIVER_API_KEY: ${RIVER_API_KEY}
+  RIVER_MODEL: ${RIVER_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}
 
 
 # ─── Named Volumes ────────────────────────────────────────────────────────────

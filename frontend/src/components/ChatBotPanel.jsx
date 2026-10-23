@@ -25,6 +25,156 @@ const CONTEXT_META = {
   },
 };
 
+function parseInline(text) {
+  if (!text) return '';
+  const parts = [];
+  const regex = /(\*\*.*?\*\*|\*.*?\*|`.*?`)/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.substring(lastIndex, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith('**') && token.endsWith('**')) {
+      parts.push(
+        <strong key={match.index} style={{ fontWeight: 650, color: 'var(--text-primary, #f1f5f9)' }}>
+          {token.slice(2, -2)}
+        </strong>
+      );
+    } else if (token.startsWith('`') && token.endsWith('`')) {
+      parts.push(
+        <code
+          key={match.index}
+          style={{
+            background: 'rgba(255,255,255,0.1)',
+            padding: '2px 6px',
+            borderRadius: 4,
+            fontSize: '0.88em',
+            fontFamily: 'monospace',
+            color: '#38bdf8',
+          }}
+        >
+          {token.slice(1, -1)}
+        </code>
+      );
+    } else if (token.startsWith('*') && token.endsWith('*')) {
+      parts.push(
+        <em key={match.index} style={{ fontStyle: 'italic', opacity: 0.9 }}>
+          {token.slice(1, -1)}
+        </em>
+      );
+    }
+    lastIndex = regex.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    parts.push(text.substring(lastIndex));
+  }
+  return parts.length > 0 ? parts : text;
+}
+
+function FormattedMessage({ content }) {
+  if (!content) return null;
+
+  const lines = content.split('\n');
+  const elements = [];
+  let currentListItems = [];
+
+  const flushList = () => {
+    if (currentListItems.length > 0) {
+      elements.push(
+        <ul
+          key={`list-${elements.length}`}
+          style={{
+            margin: '6px 0',
+            paddingLeft: 18,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+          }}
+        >
+          {currentListItems.map((item, idx) => (
+            <li key={idx} style={{ lineHeight: 1.55 }}>
+              {parseInline(item)}
+            </li>
+          ))}
+        </ul>
+      );
+      currentListItems = [];
+    }
+  };
+
+  lines.forEach((line, idx) => {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('### ')) {
+      flushList();
+      elements.push(
+        <h4
+          key={idx}
+          style={{
+            fontSize: 13.5,
+            fontWeight: 700,
+            margin: '8px 0 3px',
+            color: 'var(--text-primary, #fff)',
+          }}
+        >
+          {parseInline(trimmed.slice(4))}
+        </h4>
+      );
+    } else if (trimmed.startsWith('## ')) {
+      flushList();
+      elements.push(
+        <h3
+          key={idx}
+          style={{
+            fontSize: 14.5,
+            fontWeight: 700,
+            margin: '10px 0 4px',
+            color: 'var(--text-primary, #fff)',
+          }}
+        >
+          {parseInline(trimmed.slice(3))}
+        </h3>
+      );
+    } else if (trimmed.startsWith('# ')) {
+      flushList();
+      elements.push(
+        <h2
+          key={idx}
+          style={{
+            fontSize: 15.5,
+            fontWeight: 700,
+            margin: '12px 0 6px',
+            color: 'var(--text-primary, #fff)',
+          }}
+        >
+          {parseInline(trimmed.slice(2))}
+        </h2>
+      );
+    } else if (/^[-*•]\s+/.test(trimmed)) {
+      currentListItems.push(trimmed.replace(/^[-*•]\s+/, ''));
+    } else if (/^\d+\.\s+/.test(trimmed)) {
+      currentListItems.push(trimmed.replace(/^\d+\.\s+/, ''));
+    } else if (trimmed === '') {
+      flushList();
+      elements.push(<div key={idx} style={{ height: 6 }} />);
+    } else {
+      flushList();
+      elements.push(
+        <p key={idx} style={{ margin: '3px 0', lineHeight: 1.55 }}>
+          {parseInline(line)}
+        </p>
+      );
+    }
+  });
+
+  flushList();
+
+  return <div style={{ wordBreak: 'break-word' }}>{elements}</div>;
+}
+
 function MessageBubble({ msg }) {
   const isUser = msg.role === 'user';
   return (
@@ -64,8 +214,8 @@ function MessageBubble({ msg }) {
       {/* Bubble */}
       <div
         style={{
-          maxWidth: '80%',
-          padding: '10px 13px',
+          maxWidth: '82%',
+          padding: '10px 14px',
           borderRadius: isUser ? '14px 4px 14px 14px' : '4px 14px 14px 14px',
           background: isUser
             ? 'rgba(255,255,255,0.07)'
@@ -74,11 +224,13 @@ function MessageBubble({ msg }) {
           fontSize: 13,
           lineHeight: 1.6,
           color: 'var(--text-primary)',
-          whiteSpace: 'pre-wrap',
-          wordBreak: 'break-word',
         }}
       >
-        {msg.content}
+        {isUser ? (
+          <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{msg.content}</span>
+        ) : (
+          <FormattedMessage content={msg.content} />
+        )}
       </div>
     </div>
   );
@@ -113,7 +265,7 @@ function TypingIndicator() {
   );
 }
 
-export default function ChatBotPanel({ platform }) {
+export default function ChatBotPanel({ platform, activeItem = null }) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -160,6 +312,7 @@ export default function ChatBotPanel({ platform }) {
         body: JSON.stringify({
           question,
           context: platform,
+          active_item: activeItem || null,
           // Last 6 messages (≈3 turns) for multi-turn context
           history: messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
         }),
@@ -389,7 +542,7 @@ export default function ChatBotPanel({ platform }) {
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, textAlign: 'center' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 4px #22c55e', display: 'inline-block' }} />
-              Live DB data · Google Gemini · Enter to send
+              Live DB data · DeepSeek via River.ai · Enter to send
             </span>
             </div>
           </div>

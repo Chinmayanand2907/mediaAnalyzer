@@ -8,17 +8,23 @@ import ChatBotPanel from '../components/ChatBotPanel';
 export default function Dashboard() {
   // Global platform state: 'youtube' | 'reddit' | 'cross-platform'
   const [platform, setPlatform] = useState('youtube');
+  const [activeItem, setActiveItem] = useState(null);
+
+  const handlePlatformChange = (p) => {
+    setPlatform(p);
+    setActiveItem(null);
+  };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
       {/* ── Global Top Navigation ── */}
-      <Navbar platform={platform} onPlatformChange={setPlatform} />
+      <Navbar platform={platform} onPlatformChange={handlePlatformChange} />
 
       {/* ── Main Content Area ── */}
       <main style={{ flex: 1, padding: '32px 24px', maxWidth: 1280, margin: '0 auto', width: '100%' }}>
-        {platform === 'youtube'        && <YoutubeView />}
-        {platform === 'reddit'         && <RedditView />}
-        {platform === 'cross-platform' && <CrossPlatformView />}
+        {platform === 'youtube'        && <YoutubeView onActiveChange={setActiveItem} />}
+        {platform === 'reddit'         && <RedditView onActiveChange={setActiveItem} />}
+        {platform === 'cross-platform' && <CrossPlatformView onActiveChange={setActiveItem} />}
       </main>
 
       {/* ── Footer ── */}
@@ -34,7 +40,7 @@ export default function Dashboard() {
       </footer>
 
       {/* ── Floating AI Chatbot Panel ── */}
-      <ChatBotPanel platform={platform} />
+      <ChatBotPanel platform={platform} activeItem={activeItem} />
     </div>
   );
 }

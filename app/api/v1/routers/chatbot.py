@@ -7,7 +7,7 @@ Endpoints
 POST /query   — Accept a user question + active dashboard context, pull
                 REAL-TIME metrics from MongoDB + PostgreSQL, inject them
                 into a dynamic system prompt, and return an AI answer from
-                Google Gemini.
+                DeepSeek V4.1 Flash via River.ai.
 
 Context → System Prompt mapping
 --------------------------------
@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 import string
 from collections import Counter
-from typing import Literal
+from typing import Literal, Optional, List, Dict, Any
 
 from fastapi import APIRouter, HTTPException, status
 from openai import AsyncOpenAI, APIConnectionError, AuthenticationError, RateLimitError
@@ -39,6 +39,16 @@ from app.db.mongodb import get_comments_collection, get_video_payloads_collectio
 from app.db.postgres import Platform, PlatformAccount, AsyncSessionLocal
 
 router = APIRouter(prefix="/chatbot", tags=["Chatbot"])
+
+_sentiment_svc = None
+
+
+def _get_sentiment_svc():
+    global _sentiment_svc
+    if _sentiment_svc is None:
+        from app.services.analytics.sentiment_service import SentimentService
+        _sentiment_svc = SentimentService()
+    return _sentiment_svc
 
 # ─── Stopwords for keyword extraction ─────────────────────────────────────────
 
@@ -82,18 +92,15 @@ def _extract_keywords(texts: list[str], top_n: int = 8) -> list[str]:
 
 # ─── Real-time context fetchers ───────────────────────────────────────────────
 
-async def _fetch_youtube_context() -> str:
+async def _fetch_youtube_context(active_channel_id: Optional[str] = None) -> str:
     """Pull real YouTube metrics from PostgreSQL + MongoDB."""
-    from sqlalchemy import select, text
+    from sqlalchemy import select as sa_select
 
     try:
         payloads_coll = get_video_payloads_collection()
         comments_coll = get_comments_collection()
 
-        # --- PostgreSQL: get all tracked YouTube channels ---
         channels_data = []
-        from sqlalchemy import select as sa_select  # noqa: PLC0415
-
         async with AsyncSessionLocal() as session:
             stmt = sa_select(PlatformAccount).where(
                 PlatformAccount.platform == Platform.YOUTUBE
@@ -110,9 +117,21 @@ async def _fetch_youtube_context() -> str:
         if not channels_data:
             return "No YouTube channels are currently being tracked in the database."
 
-        lines = [f"TRACKED YOUTUBE CHANNELS ({len(channels_data)} total):"]
+        # If user is currently viewing a specific channel, prioritize it first
+        if active_channel_id:
+            channels_data.sort(
+                key=lambda x: (
+                    0 if x["channel_id"].lower() == active_channel_id.lower()
+                    or active_channel_id.lower() in x["name"].lower()
+                    else 1
+                )
+            )
 
-        for ch in channels_data[:5]:  # limit to top 5 to keep prompt size manageable
+        lines = [f"TRACKED YOUTUBE CHANNELS ({len(channels_data)} total):"]
+        if active_channel_id:
+            lines.append(f"  [User is currently viewing: {active_channel_id}]")
+
+        for ch in channels_data[:6]:
             chan_id = ch["channel_id"]
             name    = ch["name"]
 
@@ -123,12 +142,11 @@ async def _fetch_youtube_context() -> str:
             )
             stats = (payload or {}).get("stats", {}) if payload else {}
 
-            # MongoDB: recent comment count + sentiment
             total_comments = await comments_coll.count_documents(
                 {"platform": "youtube", "parent_id": chan_id}
             )
 
-            # Fetch a sample of recent comments for keyword extraction
+            # Sample comments for keywords and dynamic sentiment fallback
             sample_cursor = (
                 comments_coll
                 .find({"platform": "youtube", "parent_id": chan_id}, {"_id": 0, "body": 1})
@@ -136,7 +154,7 @@ async def _fetch_youtube_context() -> str:
                 .limit(50)
             )
             sample_docs = await sample_cursor.to_list(length=50)
-            bodies = [d.get("body", "") for d in sample_docs]
+            bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
             keywords = _extract_keywords(bodies, top_n=5) if bodies else []
 
             # Sentiment counts — YouTube comments use sentiment_label field
@@ -149,12 +167,7 @@ async def _fetch_youtube_context() -> str:
             neu_count = await comments_coll.count_documents(
                 {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "neutral"}
             )
-            analyzed = pos_count + neg_count + neu_count
-            # Fall back to processed count if labels not yet assigned
-            if analyzed == 0:
-                analyzed = await comments_coll.count_documents(
-                    {"platform": "youtube", "parent_id": chan_id, "sentiment_processed": True}
-                )
+            total_labeled = pos_count + neg_count + neu_count
 
             lines.append(f"\n  Channel: {name} (ID: {chan_id})")
             lines.append(f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}")
@@ -162,16 +175,35 @@ async def _fetch_youtube_context() -> str:
             lines.append(f"    Total Likes: {_fmt(stats.get('likes'))}")
             lines.append(f"    Total Videos: {_fmt(stats.get('videos') or stats.get('video_count'))}")
             lines.append(f"    Tracked Comments: {_fmt(total_comments)}")
-            if analyzed > 0:
-                lines.append(
-                    f"    Sentiment (of {_fmt(analyzed)} analyzed): "
-                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
-                )
+
+            if total_labeled > 0:
                 dominant = max(
                     [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
                     key=lambda x: x[1]
                 )[0]
+                lines.append(
+                    f"    Sentiment ({total_labeled} analyzed): "
+                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+                )
                 lines.append(f"    Dominant Sentiment: {dominant}")
+            elif bodies:
+                try:
+                    svc = _get_sentiment_svc()
+                    results = svc.analyze_batch(bodies[:30])
+                    agg = svc.aggregate_sentiment(results)
+                    p_pct = round(agg["positive"] * 100)
+                    u_pct = round(agg["neutral"] * 100)
+                    n_pct = round(agg["negative"] * 100)
+                    lines.append(
+                        f"    Sentiment (analyzed {len(results)} recent comments): "
+                        f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
+                    )
+                    lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
+                except Exception:
+                    lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
+            else:
+                lines.append("    Sentiment: No comments ingested yet")
+
             if keywords:
                 lines.append(f"    Top Keywords in Comments: {', '.join(keywords)}")
 
@@ -181,14 +213,13 @@ async def _fetch_youtube_context() -> str:
         return f"(Could not fetch YouTube data: {exc})"
 
 
-async def _fetch_reddit_context() -> str:
+async def _fetch_reddit_context(active_subreddit: Optional[str] = None) -> str:
     """Pull real Reddit metrics from PostgreSQL + MongoDB."""
     try:
         payloads_coll = get_video_payloads_collection()
         comments_coll = get_comments_collection()
 
-        # PostgreSQL: all tracked subreddits
-        from sqlalchemy import select as sa_select  # noqa: PLC0415
+        from sqlalchemy import select as sa_select
         subreddits_data = []
 
         async with AsyncSessionLocal() as session:
@@ -207,25 +238,35 @@ async def _fetch_reddit_context() -> str:
         if not subreddits_data:
             return "No subreddits are currently being tracked in the database."
 
-        lines = [f"TRACKED SUBREDDITS ({len(subreddits_data)} total):"]
+        # If user is currently viewing a specific subreddit, prioritize it first
+        if active_subreddit:
+            clean_active = active_subreddit.lower().replace("r/", "").strip()
+            subreddits_data.sort(
+                key=lambda x: (
+                    0 if x["subreddit_name"].lower() == clean_active
+                    or clean_active in x["name"].lower()
+                    else 1
+                )
+            )
 
-        for sub in subreddits_data[:5]:
+        lines = [f"TRACKED SUBREDDITS ({len(subreddits_data)} total):"]
+        if active_subreddit:
+            lines.append(f"  [User is currently viewing: r/{active_subreddit}]")
+
+        for sub in subreddits_data[:6]:
             sub_id = sub["subreddit_name"]
             name   = sub["name"]
 
-            # MongoDB: latest payload for subreddit-level stats
             payload = await payloads_coll.find_one(
                 {"platform": "reddit", "platform_id": sub_id},
                 {"_id": 0, "stats": 1},
             )
             stats = (payload or {}).get("stats", {}) if payload else {}
 
-            # Comment stats
             total_comments = await comments_coll.count_documents(
                 {"platform": "reddit", "parent_id": sub_id}
             )
 
-            # Keyword extraction from recent comments
             sample_cursor = (
                 comments_coll
                 .find({"platform": "reddit", "parent_id": sub_id}, {"_id": 0, "body": 1})
@@ -233,10 +274,9 @@ async def _fetch_reddit_context() -> str:
                 .limit(100)
             )
             sample_docs = await sample_cursor.to_list(length=100)
-            bodies = [d.get("body", "") for d in sample_docs]
+            bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
             keywords = _extract_keywords(bodies, top_n=8) if bodies else []
 
-            # Sentiment — Reddit comments use sentiment_label OR sentiment_processed flag
             pos_count = await comments_coll.count_documents(
                 {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "positive"}
             )
@@ -246,26 +286,40 @@ async def _fetch_reddit_context() -> str:
             neu_count = await comments_coll.count_documents(
                 {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "neutral"}
             )
-            analyzed = pos_count + neg_count + neu_count
-            if analyzed == 0:
-                # Fall back: use count of processed docs if labels not yet populated
-                analyzed = await comments_coll.count_documents(
-                    {"platform": "reddit", "parent_id": sub_id, "sentiment_processed": True}
-                )
+            total_labeled = pos_count + neg_count + neu_count
 
             lines.append(f"\n  r/{name} (internal ID: {sub_id})")
             lines.append(f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}")
             lines.append(f"    Tracked Comments in DB: {_fmt(total_comments)}")
-            if analyzed > 0:
-                lines.append(
-                    f"    Sentiment (of {_fmt(analyzed)} analyzed): "
-                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
-                )
+
+            if total_labeled > 0:
                 dominant = max(
                     [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
                     key=lambda x: x[1]
                 )[0]
+                lines.append(
+                    f"    Sentiment ({total_labeled} analyzed): "
+                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+                )
                 lines.append(f"    Dominant Sentiment: {dominant}")
+            elif bodies:
+                try:
+                    svc = _get_sentiment_svc()
+                    results = svc.analyze_batch(bodies[:30])
+                    agg = svc.aggregate_sentiment(results)
+                    p_pct = round(agg["positive"] * 100)
+                    u_pct = round(agg["neutral"] * 100)
+                    n_pct = round(agg["negative"] * 100)
+                    lines.append(
+                        f"    Sentiment (analyzed {len(results)} recent comments): "
+                        f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
+                    )
+                    lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
+                except Exception:
+                    lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
+            else:
+                lines.append("    Sentiment: No comments ingested yet")
+
             if keywords:
                 lines.append(f"    Top Trending Keywords: {', '.join(keywords)}")
 
@@ -273,6 +327,50 @@ async def _fetch_reddit_context() -> str:
 
     except Exception as exc:
         return f"(Could not fetch Reddit data: {exc})"
+
+
+async def _fetch_cross_platform_context(active_video_id: Optional[str] = None) -> str:
+    """Pull real Cross-Platform propagation metrics and shared video intelligence."""
+    try:
+        from app.api.v1.routers.cross_platform import get_shared_videos
+
+        shared = await get_shared_videos(
+            subreddit_name=None,
+            video_url_or_id=active_video_id,
+            limit=200,
+        )
+
+        lines = [f"CROSS-PLATFORM CONTENT INTELLIGENCE ({len(shared)} shared YouTube videos tracked across Reddit):"]
+        if active_video_id:
+            lines.append(f"  [User is currently inspecting video: {active_video_id}]")
+
+        for v in shared[:6]:
+            title = v.youtube_title or v.youtube_video_id
+            subs = ", ".join(f"r/{s}" for s in v.reddit_subreddits) if v.reddit_subreddits else "None"
+            lines.append(f"\n  • Video: \"{title}\" (ID: {v.youtube_video_id})")
+            lines.append(f"    Discussed in: {subs}")
+            lines.append(f"    Reddit Discussions: {v.total_reddit_shares} shares/threads, {v.reddit_total_comments} comments, {v.reddit_total_upvotes} upvotes")
+            if v.propagation_speed:
+                lines.append(f"    Propagation Speed: {v.propagation_speed}")
+            if v.youtube_sentiment and v.reddit_sentiment:
+                yt_dom = v.youtube_sentiment.dominant_label
+                rd_dom = v.reddit_sentiment.dominant_label
+                lines.append(f"    YouTube Sentiment: {yt_dom} ({v.youtube_sentiment.positive*100:.0f}% pos, {v.youtube_sentiment.negative*100:.0f}% neg)")
+                lines.append(f"    Reddit Sentiment: {rd_dom} ({v.reddit_sentiment.positive*100:.0f}% pos, {v.reddit_sentiment.negative*100:.0f}% neg)")
+                if v.sentiment_disparity_note:
+                    lines.append(f"    Sentiment Disparity: {v.sentiment_disparity_note}")
+            if v.topics:
+                lines.append(f"    Discussion Topics: {', '.join(v.topics[:5])}")
+
+        yt_summary = await _fetch_youtube_context()
+        rd_summary = await _fetch_reddit_context()
+        lines.append("\n=== TRACKED PLATFORM ACCOUNTS SUMMARY ===")
+        lines.append(yt_summary)
+        lines.append("\n" + rd_summary)
+
+        return "\n".join(lines)
+    except Exception as exc:
+        return f"(Could not fetch Cross-Platform data: {exc})"
 
 
 # ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -297,6 +395,11 @@ class ChatbotRequest(BaseModel):
         ...,
         description="Active dashboard platform: 'youtube' | 'reddit' | 'cross-platform'",
         examples=["youtube"],
+    )
+    active_item: Optional[str] = Field(
+        default=None,
+        description="Active channel_id, subreddit_name, or video_id currently in view on the dashboard",
+        examples=["UCBwmMxybNva6P_5VmxjzwqA"],
     )
     history: list[ChatMessage] = Field(
         default=[],
@@ -328,8 +431,10 @@ def _build_system_prompt(context: str, live_data: str) -> str:
         ),
         "cross-platform": (
             "You are an expert Cross-Platform Content Strategist specialising in "
-            "bridging YouTube and Reddit audiences. You synthesise insights from both "
-            "platforms to create integrated channel playbooks. "
+            "bridging YouTube and Reddit audiences. You synthesize insights from both "
+            "platforms, analysing how YouTube videos propagate into Reddit communities, "
+            "sentiment disparity between YouTube viewers and Reddit commenters, and "
+            "discussion topic resonance. "
         ),
     }
 
@@ -337,12 +442,12 @@ def _build_system_prompt(context: str, live_data: str) -> str:
         "IMPORTANT RULES:\n"
         "- You have been given REAL, LIVE data from the user's actual database below.\n"
         "- ALWAYS use this real data to answer questions — never invent or fabricate numbers.\n"
-        "- If a specific metric shows 'N/A', it means it hasn't been ingested yet; say so clearly.\n"
-        "- For Reddit: sentiment may show only a processed count (not a pos/neg breakdown) — if so, say 'sentiment analysis has run on X comments but label breakdown is pending'.\n"
+        "- If the user is currently viewing a specific channel, subreddit, or video (indicated in the data), tailor your answer directly to that entity.\n"
+        "- If a metric shows 'N/A', it means it hasn't been ingested yet; say so clearly.\n"
         "- Give concise, data-informed, actionable advice based strictly on the numbers provided.\n"
         "- Do NOT give generic social media advice unrelated to the live data shown.\n"
         "- Keep answers under 400 words unless a detailed breakdown is explicitly requested.\n"
-        "- If the user asks about something not in the data, clearly state what data IS available and suggest running an ingestion.\n"
+        "- If the user asks about something not in the data, clearly state what data IS available.\n"
         "- You are having a conversation — remember earlier messages in this chat.\n"
     )
 
@@ -365,48 +470,47 @@ def _build_system_prompt(context: str, live_data: str) -> str:
     description=(
         "Submit a question along with the active dashboard platform context. "
         "The system fetches REAL metrics from MongoDB + PostgreSQL, injects them "
-        "into the system prompt, then calls Gemini LLM so answers are based on your "
-        "actual data — not hallucinated numbers."
+        "into the system prompt, then calls DeepSeek V4.1 Flash via River.ai so "
+        "answers are based on your actual data — not hallucinated numbers."
     ),
 )
 async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     """
-    1. Fetch real-time metrics from the database for the given context.
+    1. Fetch real-time metrics from the database for the given context and active item.
     2. Build a system prompt containing those metrics.
-    3. Call the Gemini API with the enriched prompt.
+    3. Call DeepSeek V4.1 Flash via River.ai with the enriched prompt.
     4. Return the grounded, data-aware response.
     """
+    get_settings.cache_clear()
     settings = get_settings()
 
-    if not settings.GEMINI_API_KEY:
+    if not settings.RIVER_API_KEY or settings.RIVER_API_KEY == "your_river_api_key_here":
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
-                "Chatbot is not configured. Please set GEMINI_API_KEY in your "
-                ".env file. Get an API key at https://aistudio.google.com"
+                "Chatbot is not configured. Please paste your actual RIVER_API_KEY in your "
+                ".env file and save the file (Cmd+S). Get an API key at https://river.ai"
             ),
         )
 
     # ── 1. Fetch live data based on context ──────────────────────────────────
     if payload.context == "youtube":
-        live_data = await _fetch_youtube_context()
+        live_data = await _fetch_youtube_context(payload.active_item)
     elif payload.context == "reddit":
-        live_data = await _fetch_reddit_context()
+        live_data = await _fetch_reddit_context(payload.active_item)
     else:  # cross-platform
-        yt_data  = await _fetch_youtube_context()
-        rd_data  = await _fetch_reddit_context()
-        live_data = f"--- YouTube ---\n{yt_data}\n\n--- Reddit ---\n{rd_data}"
+        live_data = await _fetch_cross_platform_context(payload.active_item)
 
     # ── 2. Build grounded system prompt ──────────────────────────────────────
     system_prompt = _build_system_prompt(payload.context, live_data)
 
-    # ── 3. Call Google Gemini LLM ─────────────────────────────────────────────
+    # ── 3. Call DeepSeek V4.1 Flash via River.ai ─────────────────────────────
     client = AsyncOpenAI(
-        api_key=settings.GEMINI_API_KEY,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        api_key=settings.RIVER_API_KEY,
+        base_url="https://api.river.ai/v1",
     )
 
-    model = settings.GEMINI_MODEL
+    model = settings.RIVER_MODEL
 
     # Build messages list: system + prior history (last 6 turns) + current question
     history_msgs = [
@@ -428,17 +532,17 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
     except AuthenticationError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid GEMINI_API_KEY. Please verify your key at https://aistudio.google.com",
+            detail="Invalid RIVER_API_KEY. Please verify your key at https://river.ai",
         )
     except RateLimitError:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Gemini API rate limit reached. Please wait a moment and try again.",
+            detail="River.ai rate limit reached. Please wait a moment and try again.",
         )
     except APIConnectionError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Could not connect to the Gemini API. Please try again later.",
+            detail="Could not connect to River.ai API. Please try again later.",
         )
     except Exception as exc:
         import logging as _logging

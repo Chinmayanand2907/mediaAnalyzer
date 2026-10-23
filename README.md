@@ -147,7 +147,7 @@ Open `.env` and fill in your credentials:
 | `MONGO_URI` | MongoDB Atlas → Connect → Drivers |
 | `YOUTUBE_API_KEY` | [Google Cloud Console](https://console.cloud.google.com/) → YouTube Data API v3 |
 | `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | [Reddit App Preferences](https://www.reddit.com/prefs/apps) → create a script app |
-| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com) |
+| `RIVER_API_KEY` | [river.ai](https://river.ai) → Dashboard → API Keys |
 
 ---
 
@@ -325,8 +325,8 @@ Test coverage includes API router mocks, external API client mocking, PostgreSQL
 | `REDDIT_CLIENT_SECRET` | — | Reddit OAuth2 app secret |
 | `REDDIT_USER_AGENT` | `EngageLens/3.0` | PRAW user-agent string |
 | `REDDIT_RATE_LIMIT_CALLS_PER_MIN` | `60` | Reddit API token-bucket capacity (req/min) |
-| `GEMINI_API_KEY` | — | Google Gemini API key |
-| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model identifier |
+| `RIVER_API_KEY` | — | River.ai API key (DeepSeek inference) |
+| `RIVER_MODEL` | `deepseek-ai/DeepSeek-V4.1-Flash` | DeepSeek model identifier via River.ai |
 | `SEMANTIC_SIMILARITY_THRESHOLD` | `0.55` | Cosine similarity cut-off for cross-platform content matching |
 | `SEMANTIC_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | SentenceTransformer model for semantic linking |
 | `VITE_API_TARGET` | `http://localhost:8000` | Frontend proxy target override (local dev only) |

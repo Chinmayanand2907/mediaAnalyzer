@@ -39,7 +39,7 @@ const KeywordTooltip = ({ active, payload }) => {
   );
 };
 
-export default function RedditView() {
+export default function RedditView({ onActiveChange }) {
   const [selectedSub, setSelectedSub]     = useState(null);
   const [newSubInput, setNewSubInput]     = useState('');
   const [inputMode, setInputMode]         = useState(false);
@@ -88,6 +88,13 @@ export default function RedditView() {
       setSelectedSub(subreddits[0].subreddit_name);
     }
   }, [subreddits, selectedSub]);
+
+  // Notify parent of active subreddit change
+  useEffect(() => {
+    if (selectedSub) {
+      onActiveChange?.(selectedSub);
+    }
+  }, [selectedSub, onActiveChange]);
 
   const handleIngest = async (subName) => {
     const rawTarget = subName || selectedSub;

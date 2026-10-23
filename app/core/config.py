@@ -102,18 +102,19 @@ class Settings(BaseSettings):
         description="Reddit API max requests per minute (token-bucket capacity).",
     )
 
-    # ── Gemini LLM ───────────────────────────────────────────────────────────
-    GEMINI_API_KEY: str = Field(
+    # ── River.ai LLM (Chatbot) ───────────────────────────────────────────────
+    RIVER_API_KEY: str = Field(
         default="",
-        description="Google Gemini API key — get one at aistudio.google.com",
+        description="River.ai API key — get one at https://river.ai",
     )
-    GEMINI_MODEL: str = Field(
-        default="gemini-2.5-flash-lite",
+    RIVER_MODEL: str = Field(
+        default="deepseek-ai/DeepSeek-V4.1-Flash",
         description=(
-            "Gemini model name used by the chatbot endpoint. "
-            "Override in .env — e.g. GEMINI_MODEL=gemini-2.5-flash-lite"
+            "River.ai model name used by the chatbot endpoint. "
+            "Override in .env — e.g. RIVER_MODEL=deepseek-ai/DeepSeek-V4.1-Flash"
         ),
     )
+
 
     # ── Semantic Matching (Sentence-BERT) ────────────────────────────────────
     SEMANTIC_SIMILARITY_THRESHOLD: float = Field(

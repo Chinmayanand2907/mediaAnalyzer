@@ -27,7 +27,7 @@ function fmt(n) {
   return n.toLocaleString();
 }
 
-export default function YoutubeView() {
+export default function YoutubeView({ onActiveChange }) {
   const [selectedChannel, setSelectedChannel] = useState(null);
   const [newChannelInput, setNewChannelInput] = useState('');
   const [channelIdError, setChannelIdError]   = useState('');
@@ -70,6 +70,13 @@ export default function YoutubeView() {
       setSelectedChannel(channels[0].channel_id);
     }
   }, [channels, selectedChannel]);
+
+  // Notify parent of active channel change
+  useEffect(() => {
+    if (selectedChannel) {
+      onActiveChange?.(selectedChannel);
+    }
+  }, [selectedChannel, onActiveChange]);
 
   const handleIngest = async (channelId) => {
     const rawTarget = channelId || selectedChannel;
