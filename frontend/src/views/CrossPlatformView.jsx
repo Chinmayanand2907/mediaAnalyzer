@@ -466,7 +466,7 @@ export default function CrossPlatformView({ onActiveChange }) {
         <div className="skeleton" style={{ height: 220, borderRadius: 12 }} />
       )}
 
-      {/* ── Top Reddit Discussions ───────────────────────────────────────── */}
+      {/* ── Top Reddit Discussions (Post-centric) ────────────────────────── */}
       {activeVideo && !videoLoading && videoEngagement && (
         videoEngagement.discussions?.length > 0 ? (
           <div className="glass-card" style={{ padding: 20, border: '1px solid rgba(6,182,212,0.25)' }}>
@@ -474,67 +474,140 @@ export default function CrossPlatformView({ onActiveChange }) {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <MessageSquare size={16} color="var(--rd-primary)" />
                 <h3 style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-                  Top Reddit Discussions ({videoEngagement.discussions.length} shown from {videoEngagement.reddit_posts_count ?? videoEngagement.subreddits_count ?? ''} post{videoEngagement.reddit_posts_count !== 1 ? 's' : ''})
+                  Top Reddit Posts About This Video ({videoEngagement.discussions.length} thread{videoEngagement.discussions.length !== 1 ? 's' : ''} across {videoEngagement.subreddits_list?.length || videoEngagement.subreddits_count || 0} subreddit{(videoEngagement.subreddits_list?.length || videoEngagement.subreddits_count || 0) !== 1 ? 's' : ''})
                 </h3>
               </div>
               <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
-                Highest-scoring comments from Reddit threads about this video across:{' '}
+                Reddit posts discussing this video in:{' '}
                 <strong style={{ color: 'var(--cx-primary)' }}>
                   {videoEngagement.subreddits_list?.map(s => `r/${s}`).join(', ') || 'Various Subreddits'}
                 </strong>
               </p>
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 380, overflowY: 'auto' }}>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               {videoEngagement.discussions.map((d, i) => (
                 <div
                   key={d.discussion_id || i}
                   style={{
-                    padding: 12, borderRadius: 8,
-                    background: 'rgba(255,255,255,0.02)', border: '1px solid var(--border)',
-                    display: 'flex', flexDirection: 'column', gap: 6,
+                    borderRadius: 10,
+                    background: 'rgba(255,255,255,0.02)',
+                    border: '1px solid var(--border)',
+                    overflow: 'hidden',
                   }}
                 >
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
-                      <span style={{ padding: '2px 7px', borderRadius: 4, background: 'rgba(244,63,94,0.15)', color: 'var(--rd-primary)', fontWeight: 700, fontSize: 11 }}>
-                        r/{d.subreddit}
-                      </span>
-                      <span style={{ color: 'var(--text-secondary)', fontWeight: 600 }}>u/{d.author}</span>
-                      <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>▲ {d.score} upvotes</span>
-                      {d.match_type && (
-                        <span style={{
-                          padding: '1px 6px', borderRadius: 4, fontSize: 10, fontWeight: 700,
-                          background: d.match_type === 'url' ? 'rgba(34,197,94,0.12)' : 'rgba(99,102,241,0.12)',
-                          color: d.match_type === 'url' ? '#22c55e' : 'var(--cx-primary)',
-                          border: `1px solid ${d.match_type === 'url' ? 'rgba(34,197,94,0.25)' : 'rgba(99,102,241,0.25)'}`,
-                        }}>
-                          {d.match_type === 'url' ? 'Direct Link' : 'Topic Debate'}
+                  {/* ── Post header ── */}
+                  <div style={{ padding: '12px 14px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+                    {/* Row 1: badges + link */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span style={{ padding: '2px 7px', borderRadius: 4, background: 'rgba(244,63,94,0.15)', color: 'var(--rd-primary)', fontWeight: 700, fontSize: 11 }}>
+                          r/{d.subreddit}
                         </span>
+                        {d.match_type && (
+                          <span style={{
+                            padding: '1px 6px', borderRadius: 4, fontSize: 10, fontWeight: 700,
+                            background: d.match_type === 'url' ? 'rgba(34,197,94,0.12)' : 'rgba(99,102,241,0.12)',
+                            color: d.match_type === 'url' ? '#22c55e' : 'var(--cx-primary)',
+                            border: `1px solid ${d.match_type === 'url' ? 'rgba(34,197,94,0.25)' : 'rgba(99,102,241,0.25)'}`,
+                          }}>
+                            {d.match_type === 'url' ? '🔗 Direct Link' : '💬 Topic Match'}
+                          </span>
+                        )}
+                        {d.sentiment_label && (
+                          <span style={{
+                            padding: '1px 6px', borderRadius: 10, fontSize: 10, fontWeight: 700,
+                            background: d.sentiment_label === 'positive' ? 'rgba(34,197,94,0.15)' : d.sentiment_label === 'negative' ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
+                            color: d.sentiment_label === 'positive' ? '#22c55e' : d.sentiment_label === 'negative' ? '#ef4444' : '#f59e0b',
+                          }}>
+                            {d.sentiment_label}
+                          </span>
+                        )}
+                      </div>
+                      {d.permalink && (
+                        <a
+                          href={normalizeRedditUrl(d.permalink)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{ color: 'var(--cx-primary)', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0 }}
+                        >
+                          View Thread <ExternalLink size={11} />
+                        </a>
                       )}
-                      {d.sentiment_label && (
-                        <span style={{
-                          padding: '1px 6px', borderRadius: 10, fontSize: 10, fontWeight: 700,
-                          background: d.sentiment_label === 'positive' ? 'rgba(34,197,94,0.15)' : d.sentiment_label === 'negative' ? 'rgba(239,68,68,0.15)' : 'rgba(245,158,11,0.15)',
-                          color: d.sentiment_label === 'positive' ? '#22c55e' : d.sentiment_label === 'negative' ? '#ef4444' : '#f59e0b',
-                        }}>
-                          {d.sentiment_label}
+                    </div>
+
+                    {/* Row 2: post title */}
+                    {d.post_title && (
+                      <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-primary)', margin: '0 0 6px 0', lineHeight: 1.4 }}>
+                        {d.post_title}
+                      </p>
+                    )}
+
+                    {/* Row 3: meta stats */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, fontSize: 11, color: 'var(--text-muted)', flexWrap: 'wrap' }}>
+                      <span>👤 u/{d.author}</span>
+                      <span>▲ {fmt(d.score)} upvotes</span>
+                      {d.num_comments > 0 && <span>💬 {fmt(d.num_comments)} comments</span>}
+                      {d.published_at && (
+                        <span title={d.published_at}>
+                          🕐 {new Date(d.published_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
                         </span>
                       )}
                     </div>
-                    {d.permalink && (
-                      <a
-                        href={normalizeRedditUrl(d.permalink)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        style={{ color: 'var(--cx-primary)', fontSize: 11, display: 'inline-flex', alignItems: 'center', gap: 4 }}
-                      >
-                        View on Reddit <ExternalLink size={11} />
-                      </a>
+
+                    {/* Row 4: post selftext preview (if any) */}
+                    {d.post_body && d.post_body.trim() && (
+                      <p style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 8, lineHeight: 1.5, margin: '8px 0 0 0',
+                        overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                      }}>
+                        {d.post_body}
+                      </p>
                     )}
                   </div>
-                  <p style={{ fontSize: 12, color: 'var(--text-primary)', lineHeight: 1.5, margin: 0 }}>
-                    {d.body}
-                  </p>
+
+                  {/* ── Top comments from this thread ── */}
+                  {d.top_comments?.length > 0 && (
+                    <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 260, overflowY: 'auto' }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>
+                        Top Comments ({d.top_comments.length})
+                      </div>
+                      {d.top_comments.map((c, ci) => (
+                        <div
+                          key={c.comment_id || ci}
+                          style={{
+                            padding: '8px 10px', borderRadius: 7,
+                            background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)',
+                            display: 'flex', flexDirection: 'column', gap: 4,
+                          }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--cx-primary)' }}>u/{c.author}</span>
+                              <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>▲ {c.score}</span>
+                              {c.sentiment_label && (
+                                <span style={{
+                                  padding: '1px 5px', borderRadius: 8, fontSize: 10, fontWeight: 700,
+                                  background: c.sentiment_label === 'positive' ? 'rgba(34,197,94,0.12)' : c.sentiment_label === 'negative' ? 'rgba(239,68,68,0.12)' : 'rgba(245,158,11,0.12)',
+                                  color: c.sentiment_label === 'positive' ? '#22c55e' : c.sentiment_label === 'negative' ? '#ef4444' : '#f59e0b',
+                                }}>
+                                  {c.sentiment_label}
+                                </span>
+                              )}
+                            </div>
+                            {c.permalink && (
+                              <a href={normalizeRedditUrl(c.permalink)} target="_blank" rel="noopener noreferrer"
+                                style={{ color: 'var(--text-muted)', fontSize: 10, display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                                <ExternalLink size={9} />
+                              </a>
+                            )}
+                          </div>
+                          <p style={{ fontSize: 12, color: 'var(--text-primary)', lineHeight: 1.5, margin: 0 }}>
+                            {c.body}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -553,6 +626,7 @@ export default function CrossPlatformView({ onActiveChange }) {
           </div>
         )
       )}
+
 
       {/* ── Sentiment Comparison ─────────────────────────────────────────── */}
       <div className="glass-card" style={{ padding: 20 }}>

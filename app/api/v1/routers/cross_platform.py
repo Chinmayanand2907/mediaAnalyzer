@@ -54,6 +54,7 @@ from app.api.v1.schemas import (
     CrossPlatformTopicCorrelation,
     PlatformEngagementComparison,
     PlatformSentimentBreakdown,
+    RedditCommentItem,
     RedditDiscussionItem,
     SharedVideoItem,
     VideoCrossPlatformEngagementResponse,
@@ -1384,6 +1385,8 @@ async def get_video_engagement(
     # live_post_stats tracks each matched Reddit post thread separately so we can
     # surface accurate per-post counts (num_comments, score) in the KPIs.
     live_post_stats: Dict[str, Dict[str, Any]] = {}  # post_id -> {subreddit, score, num_comments}
+    # Store the full PRAW post data by post_id so we can build post-centric discussion cards
+    live_posts_by_id: Dict[str, Dict[str, Any]] = {}
 
     try:
         live_reddit_posts = await _fetch_reddit_video_discussions(
@@ -1406,8 +1409,9 @@ async def get_video_engagement(
                     "score": p["score"],
                     "num_comments": p.get("num_comments", 0),
                 }
+                live_posts_by_id[p_id] = p
 
-            # Add top comments from this post as discussion items
+            # Add top comments from this post as discussion items (for sentiment + DB persistence)
             for c in p.get("comments", []):
                 c_id = c["id"]
                 if c_id not in seen_discussion_ids:
@@ -1562,30 +1566,93 @@ async def get_video_engagement(
         if r_doc.get("body"):
             discussion_bodies.append(r_doc["body"])
 
-        sub = (r_doc.get("parent_id") or "").lower()
-        p_id = r_doc.get("post_id") or r_doc.get("platform_id") or ""
-        score = int(r_doc.get("score") or 0)
+    # ── Build post-centric top discussions (one card per Reddit post thread) ──
+    # Each RedditDiscussionItem represents a Reddit POST about the video,
+    # with its top comments embedded so the UI can render a proper thread view.
+    # Primary source: live PRAW posts (full title, selftext, comments).
+    seen_top_post_ids: set = set()
+    top_discussions: List[RedditDiscussionItem] = []
 
-        reddit_discussions.append(
+    sorted_live_posts = sorted(
+        live_posts_by_id.values(),
+        key=lambda p: int(p.get("score", 0)),
+        reverse=True,
+    )
+
+    for p in sorted_live_posts:
+        p_id = p["post_id"]
+        if p_id in seen_top_post_ids:
+            continue
+        seen_top_post_ids.add(p_id)
+
+        # Build top comments for this thread
+        thread_labels: List[str] = []
+        thread_comment_items: List[RedditCommentItem] = []
+        for c in p.get("comments", []):
+            c_body = c.get("body", "")
+            c_label_val, c_score_val = quick_sentiment_map.get(c_body, ("neutral", 0.5))
+            if c_label_val:
+                thread_labels.append(c_label_val)
+            c_pub_iso = (
+                datetime.fromtimestamp(c["created_utc"], tz=timezone.utc).isoformat()
+                if c.get("created_utc") else None
+            )
+            thread_comment_items.append(
+                RedditCommentItem(
+                    comment_id=c["id"],
+                    author=c.get("author") or "[deleted]",
+                    body=c_body,
+                    score=int(c.get("score") or 0),
+                    published_at=c_pub_iso,
+                    permalink=c.get("permalink"),
+                    sentiment_label=c_label_val,
+                    sentiment_score=c_score_val,
+                )
+            )
+        # Sort comments by score desc within each thread
+        thread_comment_items.sort(key=lambda c: c.score, reverse=True)
+
+        # Dominant thread sentiment from its top comments
+        if thread_labels:
+            pos_c = thread_labels.count("positive")
+            neg_c = thread_labels.count("negative")
+            neu_c = thread_labels.count("neutral")
+            thread_sent = max(
+                [("positive", pos_c), ("neutral", neu_c), ("negative", neg_c)],
+                key=lambda x: x[1],
+            )[0]
+        else:
+            thread_sent = "neutral"
+
+        p_pub_iso = (
+            datetime.fromtimestamp(p["created_utc"], tz=timezone.utc).isoformat()
+            if p.get("created_utc") else None
+        )
+
+        top_discussions.append(
             RedditDiscussionItem(
-                discussion_id=r_doc.get("platform_id", ""),
+                discussion_id=p_id,
                 post_id=p_id,
-                subreddit=sub,
-                author=r_doc.get("author") or "[deleted]",
-                body=r_doc.get("body", ""),
-                score=score,
-                published_at=pub_str,
-                permalink=r_doc.get("permalink"),
-                sentiment_label=label,
-                sentiment_score=s_score,
-                match_type=r_doc.get("match_type", "url"),
-                similarity_score=r_doc.get("similarity_score", 1.0),
+                subreddit=(p.get("subreddit") or "").lower(),
+                post_title=p.get("title") or "",
+                post_url=p.get("url") or "",
+                post_body=p.get("selftext") or "",
+                num_comments=int(p.get("num_comments") or 0),
+                author=p.get("author") or "[deleted]",
+                score=int(p.get("score") or 0),
+                published_at=p_pub_iso,
+                permalink=p.get("permalink") or "",
+                match_type=p.get("match_type") or "url",
+                similarity_score=p.get("similarity_score"),
+                sentiment_label=thread_sent,
+                body=p.get("selftext") or "",
+                top_comments=thread_comment_items,
             )
         )
 
-    # Sort all discussions by score descending, keep top 10 for the UI card
-    reddit_discussions.sort(key=lambda d: d.score, reverse=True)
-    top_discussions = reddit_discussions[:10]
+    # Cap at top 10 Reddit post threads
+    top_discussions = top_discussions[:10]
+
 
     # 4. Propagation timeline
     first_shared_dt = min(discussion_dates) if discussion_dates else None
@@ -1734,11 +1801,11 @@ async def get_sentiment_comparison(
     # 1. Fetch Reddit sentiment distribution
     rd_filter: Dict[str, Any] = {"platform": "reddit"}
     clean_sub = None
-    if subreddit_name:
+    if subreddit_name and isinstance(subreddit_name, str):
         clean_sub = subreddit_name.strip().lstrip("/").replace("r/", "").replace("/r/", "").strip().lower()
         rd_filter["parent_id"] = {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}
 
-    vid_id = _extract_video_id(video_url_or_id) if video_url_or_id else None
+    vid_id = _extract_video_id(video_url_or_id) if (video_url_or_id and isinstance(video_url_or_id, str)) else None
 
     rd_labels: List[str] = []
 
@@ -1798,7 +1865,7 @@ async def get_sentiment_comparison(
 
     elif clean_sub:
         rd_cursor = comments_coll.find(
-            {"platform": "reddit", "parent_id": {"": f"^{re.escape(clean_sub)}$", "off on off off off off off off off off on off on off off off off off on off off off on on off off off off on off off off off off off off off off off off off on off off off off off off off on off on on off off off on off off on off off on off off on off on off off on off on off off off off on off off off on off off on off off off off off off off off on off on off off on off off off off off off off off off off off off on off off off on off on off on on off off off off on on off off on on off on off on on off off off off on on off off on off off off off off on off off on off off on off off off off off off on off off off off on on off on off off off off off on off on off off off off off off off off off off on on off on off off off": "i"}},
+            {"platform": "reddit", "parent_id": {"$regex": f"^{re.escape(clean_sub)}$", "$options": "i"}},
             {"_id": 0, "sentiment_label": 1, "body": 1},
         ).limit(200)
         rd_docs = await rd_cursor.to_list(length=200)
@@ -1832,7 +1899,7 @@ async def get_sentiment_comparison(
     yt_labels: List[str] = []
     if vid_id:
         yt_cursor = comments_coll.find(
-            {"platform": "youtube", "": [{"video_id": vid_id}, {"parent_id": vid_id}]},
+            {"platform": "youtube", "$or": [{"video_id": vid_id}, {"parent_id": vid_id}]},
             {"_id": 0, "sentiment_label": 1, "body": 1},
         ).limit(200)
         yt_docs = await yt_cursor.to_list(length=200)

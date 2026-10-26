@@ -87,11 +87,9 @@ class RedditSubredditListItem(BaseModel):
 
 # ── Cross-platform ───────────────────────────────────────────────────────────
 
-class RedditDiscussionItem(BaseModel):
-    """Detailed Reddit comment or post referencing a YouTube video."""
-    discussion_id: str
-    post_id: Optional[str] = None
-    subreddit: str = ""
+class RedditCommentItem(BaseModel):
+    """A single top-level comment inside a Reddit post thread."""
+    comment_id: str
     author: str = "[deleted]"
     body: str = ""
     score: int = 0
@@ -99,8 +97,34 @@ class RedditDiscussionItem(BaseModel):
     permalink: Optional[str] = None
     sentiment_label: Optional[str] = "neutral"
     sentiment_score: Optional[float] = None
-    match_type: Optional[str] = "url"  # "url" | "semantic"
+
+
+class RedditDiscussionItem(BaseModel):
+    """A Reddit post thread referencing a YouTube video, with its top comments."""
+    discussion_id: str          # Reddit post ID
+    post_id: Optional[str] = None
+    subreddit: str = ""
+    # Post-level metadata
+    post_title: Optional[str] = None
+    post_url: Optional[str] = None
+    post_body: Optional[str] = None  # selftext
+    num_comments: int = 0
+    # Post author & score
+    author: str = "[deleted]"
+    score: int = 0
+    published_at: Optional[str] = None
+    permalink: Optional[str] = None
+    # Match confidence
+    match_type: Optional[str] = "url"  # "url" | "phrase_match" | "title_match"
     similarity_score: Optional[float] = None
+    # Sentiment of the overall thread (from top comments)
+    sentiment_label: Optional[str] = "neutral"
+    sentiment_score: Optional[float] = None
+    # Top comments from this thread
+    top_comments: List[RedditCommentItem] = Field(default_factory=list)
+
+    # Legacy compat — body is the post selftext or first comment body
+    body: str = ""
 
 
 class PlatformSentimentBreakdown(BaseModel):
