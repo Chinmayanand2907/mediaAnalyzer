@@ -25,8 +25,10 @@ Data flow
 
 from __future__ import annotations
 
+import asyncio
 import re
 import string
+import time
 from collections import Counter
 from typing import Literal, Optional, List, Dict, Any
 
@@ -49,6 +51,27 @@ def _get_sentiment_svc():
         from app.services.analytics.sentiment_service import SentimentService
         _sentiment_svc = SentimentService()
     return _sentiment_svc
+
+# ─── In-Memory TTL Cache for Context Data ──────────────────────────────────────
+# Caches fetched database context for 60 seconds to eliminate redundant roundtrips
+# on multi-turn conversations while ensuring fresh data.
+
+_CONTEXT_CACHE: dict[str, tuple[float, str]] = {}
+_CACHE_TTL_SECONDS = 60.0
+
+
+def _get_cached_context(key: str) -> Optional[str]:
+    entry = _CONTEXT_CACHE.get(key)
+    if entry:
+        ts, val = entry
+        if time.time() - ts < _CACHE_TTL_SECONDS:
+            return val
+    return None
+
+
+def _set_cached_context(key: str, val: str) -> None:
+    _CONTEXT_CACHE[key] = (time.time(), val)
+
 
 # ─── Stopwords for keyword extraction ─────────────────────────────────────────
 
@@ -90,10 +113,118 @@ def _extract_keywords(texts: list[str], top_n: int = 8) -> list[str]:
     return [w for w, _ in counts.most_common(top_n)]
 
 
-# ─── Real-time context fetchers ───────────────────────────────────────────────
+# ─── Real-time context fetchers (Concurrent + Optimized) ──────────────────────
+
+async def _fetch_single_channel_summary(
+    ch: dict,
+    payloads_coll,
+    comments_coll,
+    is_active: bool,
+) -> str:
+    """Fetch metrics and sentiment for a single YouTube channel concurrently."""
+    chan_id = ch["channel_id"]
+    name = ch["name"]
+
+    payload_task = payloads_coll.find_one(
+        {"platform": "youtube", "platform_id": chan_id},
+        {"_id": 0, "stats": 1},
+    )
+    total_comments_task = comments_coll.count_documents(
+        {"platform": "youtube", "parent_id": chan_id}
+    )
+    pos_task = comments_coll.count_documents(
+        {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "positive"}
+    )
+    neg_task = comments_coll.count_documents(
+        {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "negative"}
+    )
+    neu_task = comments_coll.count_documents(
+        {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "neutral"}
+    )
+    sample_cursor = (
+        comments_coll
+        .find({"platform": "youtube", "parent_id": chan_id}, {"_id": 0, "body": 1})
+        .sort("ingested_at", -1)
+        .limit(50)
+    )
+    sample_task = sample_cursor.to_list(length=50)
+
+    # Run all 6 channel queries in parallel
+    results = await asyncio.gather(
+        payload_task,
+        total_comments_task,
+        pos_task,
+        neg_task,
+        neu_task,
+        sample_task,
+        return_exceptions=True,
+    )
+
+    payload = results[0] if not isinstance(results[0], Exception) else None
+    total_comments = results[1] if not isinstance(results[1], Exception) else 0
+    pos_count = results[2] if not isinstance(results[2], Exception) else 0
+    neg_count = results[3] if not isinstance(results[3], Exception) else 0
+    neu_count = results[4] if not isinstance(results[4], Exception) else 0
+    sample_docs = results[5] if not isinstance(results[5], Exception) else []
+
+    stats = (payload or {}).get("stats", {}) if payload else {}
+    bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
+    keywords = _extract_keywords(bodies, top_n=5) if bodies else []
+    total_labeled = pos_count + neg_count + neu_count
+
+    lines = [
+        f"\n  Channel: {name} (ID: {chan_id})",
+        f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}",
+        f"    Total Views: {_fmt(stats.get('views'))}",
+        f"    Total Likes: {_fmt(stats.get('likes'))}",
+        f"    Total Videos: {_fmt(stats.get('videos') or stats.get('video_count'))}",
+        f"    Tracked Comments: {_fmt(total_comments)}",
+    ]
+
+    if total_labeled > 0:
+        dominant = max(
+            [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
+            key=lambda x: x[1]
+        )[0]
+        lines.append(
+            f"    Sentiment ({total_labeled} analyzed): "
+            f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+        )
+        lines.append(f"    Dominant Sentiment: {dominant}")
+    elif bodies and is_active:
+        # Dynamic fallback inference ONLY on active channel to avoid slow background CPU spikes
+        try:
+            svc = _get_sentiment_svc()
+            model_results = svc.analyze_batch(bodies[:30])
+            agg = svc.aggregate_sentiment(model_results)
+            p_pct = round(agg["positive"] * 100)
+            u_pct = round(agg["neutral"] * 100)
+            n_pct = round(agg["negative"] * 100)
+            lines.append(
+                f"    Sentiment (analyzed {len(model_results)} recent comments): "
+                f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
+            )
+            lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
+        except Exception:
+            lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
+    elif total_comments > 0:
+        lines.append(f"    Sentiment: {total_comments} comments tracked (classification queued)")
+    else:
+        lines.append("    Sentiment: No comments ingested yet")
+
+    if keywords:
+        lines.append(f"    Top Keywords in Comments: {', '.join(keywords)}")
+
+    return "\n".join(lines)
+
 
 async def _fetch_youtube_context(active_channel_id: Optional[str] = None) -> str:
-    """Pull real YouTube metrics from PostgreSQL + MongoDB."""
+    """Pull real YouTube metrics from PostgreSQL + MongoDB with parallelized I/O and caching."""
+    cache_key = f"youtube:{active_channel_id or ''}"
+    cached = _get_cached_context(cache_key)
+    if cached is not None:
+        return cached
+
     from sqlalchemy import select as sa_select
 
     try:
@@ -115,7 +246,9 @@ async def _fetch_youtube_context(active_channel_id: Optional[str] = None) -> str
                 })
 
         if not channels_data:
-            return "No YouTube channels are currently being tracked in the database."
+            res = "No YouTube channels are currently being tracked in the database."
+            _set_cached_context(cache_key, res)
+            return res
 
         # If user is currently viewing a specific channel, prioritize it first
         if active_channel_id:
@@ -127,94 +260,136 @@ async def _fetch_youtube_context(active_channel_id: Optional[str] = None) -> str
                 )
             )
 
-        lines = [f"TRACKED YOUTUBE CHANNELS ({len(channels_data)} total):"]
+        header_lines = [f"TRACKED YOUTUBE CHANNELS ({len(channels_data)} total):"]
         if active_channel_id:
-            lines.append(f"  [User is currently viewing: {active_channel_id}]")
+            header_lines.append(f"  [User is currently viewing: {active_channel_id}]")
 
-        for ch in channels_data[:6]:
-            chan_id = ch["channel_id"]
-            name    = ch["name"]
-
-            # MongoDB: latest snapshot stats for this channel
-            payload = await payloads_coll.find_one(
-                {"platform": "youtube", "platform_id": chan_id},
-                {"_id": 0, "stats": 1},
+        tasks = [
+            _fetch_single_channel_summary(
+                ch,
+                payloads_coll,
+                comments_coll,
+                is_active=(idx == 0 and bool(active_channel_id)),
             )
-            stats = (payload or {}).get("stats", {}) if payload else {}
-
-            total_comments = await comments_coll.count_documents(
-                {"platform": "youtube", "parent_id": chan_id}
-            )
-
-            # Sample comments for keywords and dynamic sentiment fallback
-            sample_cursor = (
-                comments_coll
-                .find({"platform": "youtube", "parent_id": chan_id}, {"_id": 0, "body": 1})
-                .sort("ingested_at", -1)
-                .limit(50)
-            )
-            sample_docs = await sample_cursor.to_list(length=50)
-            bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
-            keywords = _extract_keywords(bodies, top_n=5) if bodies else []
-
-            # Sentiment counts — YouTube comments use sentiment_label field
-            pos_count = await comments_coll.count_documents(
-                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "positive"}
-            )
-            neg_count = await comments_coll.count_documents(
-                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "negative"}
-            )
-            neu_count = await comments_coll.count_documents(
-                {"platform": "youtube", "parent_id": chan_id, "sentiment_label": "neutral"}
-            )
-            total_labeled = pos_count + neg_count + neu_count
-
-            lines.append(f"\n  Channel: {name} (ID: {chan_id})")
-            lines.append(f"    Subscribers: {_fmt(stats.get('subscribers') or ch.get('subscribers'))}")
-            lines.append(f"    Total Views: {_fmt(stats.get('views'))}")
-            lines.append(f"    Total Likes: {_fmt(stats.get('likes'))}")
-            lines.append(f"    Total Videos: {_fmt(stats.get('videos') or stats.get('video_count'))}")
-            lines.append(f"    Tracked Comments: {_fmt(total_comments)}")
-
-            if total_labeled > 0:
-                dominant = max(
-                    [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
-                    key=lambda x: x[1]
-                )[0]
-                lines.append(
-                    f"    Sentiment ({total_labeled} analyzed): "
-                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
-                )
-                lines.append(f"    Dominant Sentiment: {dominant}")
-            elif bodies:
-                try:
-                    svc = _get_sentiment_svc()
-                    results = svc.analyze_batch(bodies[:30])
-                    agg = svc.aggregate_sentiment(results)
-                    p_pct = round(agg["positive"] * 100)
-                    u_pct = round(agg["neutral"] * 100)
-                    n_pct = round(agg["negative"] * 100)
-                    lines.append(
-                        f"    Sentiment (analyzed {len(results)} recent comments): "
-                        f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
-                    )
-                    lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
-                except Exception:
-                    lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
-            else:
-                lines.append("    Sentiment: No comments ingested yet")
-
-            if keywords:
-                lines.append(f"    Top Keywords in Comments: {', '.join(keywords)}")
-
-        return "\n".join(lines)
+            for idx, ch in enumerate(channels_data[:6])
+        ]
+        channel_summaries = await asyncio.gather(*tasks)
+        res = "\n".join(header_lines) + "\n" + "\n".join(channel_summaries)
+        _set_cached_context(cache_key, res)
+        return res
 
     except Exception as exc:
         return f"(Could not fetch YouTube data: {exc})"
 
 
+async def _fetch_single_subreddit_summary(
+    sub: dict,
+    payloads_coll,
+    comments_coll,
+    is_active: bool,
+) -> str:
+    """Fetch metrics and sentiment for a single subreddit concurrently."""
+    sub_id = sub["subreddit_name"]
+    name = sub["name"]
+
+    payload_task = payloads_coll.find_one(
+        {"platform": "reddit", "platform_id": sub_id},
+        {"_id": 0, "stats": 1},
+    )
+    total_comments_task = comments_coll.count_documents(
+        {"platform": "reddit", "parent_id": sub_id}
+    )
+    pos_task = comments_coll.count_documents(
+        {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "positive"}
+    )
+    neg_task = comments_coll.count_documents(
+        {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "negative"}
+    )
+    neu_task = comments_coll.count_documents(
+        {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "neutral"}
+    )
+    sample_cursor = (
+        comments_coll
+        .find({"platform": "reddit", "parent_id": sub_id}, {"_id": 0, "body": 1})
+        .sort("ingested_at", -1)
+        .limit(100)
+    )
+    sample_task = sample_cursor.to_list(length=100)
+
+    # Run all 6 subreddit queries in parallel
+    results = await asyncio.gather(
+        payload_task,
+        total_comments_task,
+        pos_task,
+        neg_task,
+        neu_task,
+        sample_task,
+        return_exceptions=True,
+    )
+
+    payload = results[0] if not isinstance(results[0], Exception) else None
+    total_comments = results[1] if not isinstance(results[1], Exception) else 0
+    pos_count = results[2] if not isinstance(results[2], Exception) else 0
+    neg_count = results[3] if not isinstance(results[3], Exception) else 0
+    neu_count = results[4] if not isinstance(results[4], Exception) else 0
+    sample_docs = results[5] if not isinstance(results[5], Exception) else []
+
+    stats = (payload or {}).get("stats", {}) if payload else {}
+    bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
+    keywords = _extract_keywords(bodies, top_n=8) if bodies else []
+    total_labeled = pos_count + neg_count + neu_count
+
+    lines = [
+        f"\n  r/{name} (internal ID: {sub_id})",
+        f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}",
+        f"    Tracked Comments in DB: {_fmt(total_comments)}",
+    ]
+
+    if total_labeled > 0:
+        dominant = max(
+            [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
+            key=lambda x: x[1]
+        )[0]
+        lines.append(
+            f"    Sentiment ({total_labeled} analyzed): "
+            f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
+        )
+        lines.append(f"    Dominant Sentiment: {dominant}")
+    elif bodies and is_active:
+        # Dynamic fallback inference ONLY on active subreddit to prevent CPU overhead
+        try:
+            svc = _get_sentiment_svc()
+            model_results = svc.analyze_batch(bodies[:30])
+            agg = svc.aggregate_sentiment(model_results)
+            p_pct = round(agg["positive"] * 100)
+            u_pct = round(agg["neutral"] * 100)
+            n_pct = round(agg["negative"] * 100)
+            lines.append(
+                f"    Sentiment (analyzed {len(model_results)} recent comments): "
+                f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
+            )
+            lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
+        except Exception:
+            lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
+    elif total_comments > 0:
+        lines.append(f"    Sentiment: {total_comments} comments tracked (classification queued)")
+    else:
+        lines.append("    Sentiment: No comments ingested yet")
+
+    if keywords:
+        lines.append(f"    Top Trending Keywords: {', '.join(keywords)}")
+
+    return "\n".join(lines)
+
+
 async def _fetch_reddit_context(active_subreddit: Optional[str] = None) -> str:
-    """Pull real Reddit metrics from PostgreSQL + MongoDB."""
+    """Pull real Reddit metrics from PostgreSQL + MongoDB with parallelized I/O and caching."""
+    clean_active = active_subreddit.lower().replace("r/", "").strip() if active_subreddit else None
+    cache_key = f"reddit:{clean_active or ''}"
+    cached = _get_cached_context(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         payloads_coll = get_video_payloads_collection()
         comments_coll = get_comments_collection()
@@ -236,11 +411,12 @@ async def _fetch_reddit_context(active_subreddit: Optional[str] = None) -> str:
                 })
 
         if not subreddits_data:
-            return "No subreddits are currently being tracked in the database."
+            res = "No subreddits are currently being tracked in the database."
+            _set_cached_context(cache_key, res)
+            return res
 
         # If user is currently viewing a specific subreddit, prioritize it first
-        if active_subreddit:
-            clean_active = active_subreddit.lower().replace("r/", "").strip()
+        if clean_active:
             subreddits_data.sort(
                 key=lambda x: (
                     0 if x["subreddit_name"].lower() == clean_active
@@ -249,95 +425,49 @@ async def _fetch_reddit_context(active_subreddit: Optional[str] = None) -> str:
                 )
             )
 
-        lines = [f"TRACKED SUBREDDITS ({len(subreddits_data)} total):"]
-        if active_subreddit:
-            lines.append(f"  [User is currently viewing: r/{active_subreddit}]")
+        header_lines = [f"TRACKED SUBREDDITS ({len(subreddits_data)} total):"]
+        if clean_active:
+            header_lines.append(f"  [User is currently viewing: r/{clean_active}]")
 
-        for sub in subreddits_data[:6]:
-            sub_id = sub["subreddit_name"]
-            name   = sub["name"]
-
-            payload = await payloads_coll.find_one(
-                {"platform": "reddit", "platform_id": sub_id},
-                {"_id": 0, "stats": 1},
+        tasks = [
+            _fetch_single_subreddit_summary(
+                sub,
+                payloads_coll,
+                comments_coll,
+                is_active=(idx == 0 and bool(clean_active)),
             )
-            stats = (payload or {}).get("stats", {}) if payload else {}
-
-            total_comments = await comments_coll.count_documents(
-                {"platform": "reddit", "parent_id": sub_id}
-            )
-
-            sample_cursor = (
-                comments_coll
-                .find({"platform": "reddit", "parent_id": sub_id}, {"_id": 0, "body": 1})
-                .sort("ingested_at", -1)
-                .limit(100)
-            )
-            sample_docs = await sample_cursor.to_list(length=100)
-            bodies = [d.get("body", "") for d in sample_docs if d.get("body")]
-            keywords = _extract_keywords(bodies, top_n=8) if bodies else []
-
-            pos_count = await comments_coll.count_documents(
-                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "positive"}
-            )
-            neg_count = await comments_coll.count_documents(
-                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "negative"}
-            )
-            neu_count = await comments_coll.count_documents(
-                {"platform": "reddit", "parent_id": sub_id, "sentiment_label": "neutral"}
-            )
-            total_labeled = pos_count + neg_count + neu_count
-
-            lines.append(f"\n  r/{name} (internal ID: {sub_id})")
-            lines.append(f"    Members: {_fmt(stats.get('members', stats.get('subscribers')) or sub.get('members'))}")
-            lines.append(f"    Tracked Comments in DB: {_fmt(total_comments)}")
-
-            if total_labeled > 0:
-                dominant = max(
-                    [("positive", pos_count), ("neutral", neu_count), ("negative", neg_count)],
-                    key=lambda x: x[1]
-                )[0]
-                lines.append(
-                    f"    Sentiment ({total_labeled} analyzed): "
-                    f"✅ {pos_count} positive | ⚪ {neu_count} neutral | ❌ {neg_count} negative"
-                )
-                lines.append(f"    Dominant Sentiment: {dominant}")
-            elif bodies:
-                try:
-                    svc = _get_sentiment_svc()
-                    results = svc.analyze_batch(bodies[:30])
-                    agg = svc.aggregate_sentiment(results)
-                    p_pct = round(agg["positive"] * 100)
-                    u_pct = round(agg["neutral"] * 100)
-                    n_pct = round(agg["negative"] * 100)
-                    lines.append(
-                        f"    Sentiment (analyzed {len(results)} recent comments): "
-                        f"✅ {p_pct}% positive | ⚪ {u_pct}% neutral | ❌ {n_pct}% negative"
-                    )
-                    lines.append(f"    Dominant Sentiment: {agg['dominant_label']}")
-                except Exception:
-                    lines.append(f"    Sentiment: {total_comments} comments tracked (sentiment classification pending)")
-            else:
-                lines.append("    Sentiment: No comments ingested yet")
-
-            if keywords:
-                lines.append(f"    Top Trending Keywords: {', '.join(keywords)}")
-
-        return "\n".join(lines)
+            for idx, sub in enumerate(subreddits_data[:6])
+        ]
+        subreddit_summaries = await asyncio.gather(*tasks)
+        res = "\n".join(header_lines) + "\n" + "\n".join(subreddit_summaries)
+        _set_cached_context(cache_key, res)
+        return res
 
     except Exception as exc:
         return f"(Could not fetch Reddit data: {exc})"
 
 
 async def _fetch_cross_platform_context(active_video_id: Optional[str] = None) -> str:
-    """Pull real Cross-Platform propagation metrics and shared video intelligence."""
+    """Pull real Cross-Platform propagation metrics and shared video intelligence with parallelized fetch."""
+    cache_key = f"cross-platform:{active_video_id or ''}"
+    cached = _get_cached_context(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         from app.api.v1.routers.cross_platform import get_shared_videos
 
-        shared = await get_shared_videos(
+        shared_task = get_shared_videos(
             subreddit_name=None,
             video_url_or_id=active_video_id,
             limit=200,
+        )
+        yt_task = _fetch_youtube_context()
+        rd_task = _fetch_reddit_context()
+
+        # Run shared videos, YouTube context, and Reddit context concurrently
+        shared, yt_summary, rd_summary = await asyncio.gather(
+            shared_task, yt_task, rd_task
         )
 
         lines = [f"CROSS-PLATFORM CONTENT INTELLIGENCE ({len(shared)} shared YouTube videos tracked across Reddit):"]
@@ -362,13 +492,13 @@ async def _fetch_cross_platform_context(active_video_id: Optional[str] = None) -
             if v.topics:
                 lines.append(f"    Discussion Topics: {', '.join(v.topics[:5])}")
 
-        yt_summary = await _fetch_youtube_context()
-        rd_summary = await _fetch_reddit_context()
         lines.append("\n=== TRACKED PLATFORM ACCOUNTS SUMMARY ===")
         lines.append(yt_summary)
         lines.append("\n" + rd_summary)
 
-        return "\n".join(lines)
+        res = "\n".join(lines)
+        _set_cached_context(cache_key, res)
+        return res
     except Exception as exc:
         return f"(Could not fetch Cross-Platform data: {exc})"
 
@@ -416,48 +546,98 @@ class ChatbotResponse(BaseModel):
 # ─── System prompt builder ────────────────────────────────────────────────────
 
 def _build_system_prompt(context: str, live_data: str) -> str:
-    """Build a system prompt that includes the live data snapshot."""
+    """Build a comprehensive system prompt that includes live data snapshot and strategic guidance."""
 
     base_instructions = {
         "youtube": (
-            "You are an expert YouTube Video Performance Consultant with deep knowledge "
-            "of the YouTube algorithm, audience retention, CTR optimisation, and "
-            "sentiment-driven content strategy. "
+            "You are an elite YouTube Video Performance & Growth Consultant with deep mastery "
+            "of the YouTube recommendation algorithm, viewer psychology, retention mechanics, "
+            "CTR optimization, high-converting video hooks, and sentiment-driven content strategy."
         ),
         "reddit": (
-            "You are an expert Reddit Community Management Specialist with deep "
-            "knowledge of subreddit growth strategies, upvote mechanics, community "
-            "engagement tactics, keyword trend analysis, and sentiment management. "
+            "You are an elite Reddit Community & Growth Strategist with deep knowledge "
+            "of subreddit cultures, upvote dynamics, karma mechanics, comment sentiment management, "
+            "trend discovery, and non-spammy community engagement tactics."
         ),
         "cross-platform": (
-            "You are an expert Cross-Platform Content Strategist specialising in "
-            "bridging YouTube and Reddit audiences. You synthesize insights from both "
-            "platforms, analysing how YouTube videos propagate into Reddit communities, "
-            "sentiment disparity between YouTube viewers and Reddit commenters, and "
-            "discussion topic resonance. "
+            "You are a master Cross-Platform Digital Strategist specializing in the synergy "
+            "between YouTube and Reddit. You excel at audience retention, content propagation, "
+            "bridging YouTube videos to Reddit discussions, analyzing sentiment disparities, "
+            "and designing dual-platform content strategies that hook viewers and cultivate positive sentiment."
         ),
     }
 
+    # Platform-specific playbooks tailored to the active dashboard
+    youtube_playbook = (
+        "YOUTUBE GROWTH & PERFORMANCE PLAYBOOK:\n"
+        "• Click-Through Rate (CTR) & Packaging:\n"
+        "  - Thumbnail composition: Apply the '3-Second Glance Rule' (1 primary emotional focal point, high contrast, max 3 words of bold text that complement, never repeat, the title).\n"
+        "  - Title engineering: Place high-impact keywords in the first 45 characters (mobile truncation boundary). Use cognitive tension or curiosity gaps without descending into cheap clickbait.\n"
+        "• Retention Curves & The 0–15s Hook Window:\n"
+        "  - Cold Open / Proof-First framework: Immediately demonstrate the climax, result, or high-stakes premise within 0-5s. Eliminate intro logos, theme music, or 'welcome back' pleasantries.\n"
+        "  - Diagnosing Drop-offs: 0-30s drop indicates hook/title mismatch; mid-video downward slope signals pacing fatigue (inject pattern interrupts, camera zooms, or sound hits every 4-6 seconds); sharp cliff before the end means telegraphing the wrap-up too early (seamlessly transition straight to the end screen card).\n"
+        "• Comment Section & Sentiment Engine:\n"
+        "  - Pinned question strategy: Ask an opinion-seeking or debate-sparking question within 1 hour of upload to stimulate comment velocity for the algorithm.\n"
+        "  - Sentiment reversal: Address negative feedback or confusion openly by pinning a gracious clarification; convert recurring community pain points into your next video topic."
+    )
+
+    reddit_playbook = (
+        "REDDIT COMMUNITY & GROWTH PLAYBOOK:\n"
+        "• Subreddit Culture & Anti-Self-Promotion Framing:\n"
+        "  - The 90/10 Rule: Deliver 100% of the core insight/value natively inside the Reddit text post. Use structured Markdown: bold headers, TL;DR, and concise bullet points.\n"
+        "  - Link etiquette: Never post raw video links or link-posts. Place external links (YouTube video, GitHub repo, live demo) only at the very bottom as an optional reference (*'For the full step-by-step video breakdown: [Link]'*).\n"
+        "• Upvote Velocity & The First Hour Rule:\n"
+        "  - Reddit's hot ranking algorithm heavily weighs early upvote velocity. Stay active in the thread for the first 60–90 minutes, answering every commenter with technical depth and humility.\n"
+        "  - Strict rule compliance: Adhere to subreddit-specific submission guidelines, flairs, and self-promotion blackout days.\n"
+        "• Sentiment & Focus Group Mining:\n"
+        "  - Treat Reddit as an unfiltered, brutally honest focus group. Mine community feedback, skepticism, and recurring questions to identify unmet audience needs and script better YouTube content.\n"
+        "  - Diffusing skepticism: Never respond defensively. Validate constructive criticism, explain technical trade-offs openly, and thank users for keeping you accountable."
+    )
+
+    cross_platform_playbook = (
+        "CROSS-PLATFORM SYNERGY PLAYBOOK:\n"
+        "• Dual-Platform Harmony:\n"
+        "  - YouTube drives visual storytelling, emotional connection, and high-energy demos; Reddit provides rigorous technical critique, community discourse, and focus group testing.\n"
+        "• Propagation & Bridging Strategy:\n"
+        "  - Transform YouTube video insights into native, high-value Reddit discussion threads.\n"
+        "  - Mine trending topics and controversies from subreddits to formulate high-demand YouTube video concepts.\n"
+        "• Sentiment Disparity Diagnostics:\n"
+        "  - Analyze why sentiment may diverge (e.g. YouTube viewers love personality and visuals, while Reddit users scrutinize commercial intent or technical claims). Bridge this gap with radical transparency."
+    )
+
+    playbooks = {
+        "youtube": youtube_playbook,
+        "reddit": reddit_playbook,
+        "cross-platform": cross_platform_playbook,
+    }
+
     rules = (
-        "IMPORTANT RULES:\n"
-        "- You have been given REAL, LIVE data from the user's actual database below.\n"
-        "- ALWAYS use this real data to answer questions — never invent or fabricate numbers.\n"
-        "- If the user is currently viewing a specific channel, subreddit, or video (indicated in the data), tailor your answer directly to that entity.\n"
-        "- If a metric shows 'N/A', it means it hasn't been ingested yet; say so clearly.\n"
-        "- Give concise, data-informed, actionable advice based strictly on the numbers provided.\n"
-        "- Do NOT give generic social media advice unrelated to the live data shown.\n"
-        "- Keep answers under 400 words unless a detailed breakdown is explicitly requested.\n"
-        "- If the user asks about something not in the data, clearly state what data IS available.\n"
-        "- You are having a conversation — remember earlier messages in this chat.\n"
+        "CORE OPERATING PRINCIPLES:\n"
+        "1. DUAL CAPABILITY (Data Analysis + Strategic Advisory):\n"
+        "   - FOR DATA-SPECIFIC QUESTIONS: You have REAL, LIVE data from the user's database below. "
+        "Always ground specific numbers (views, likes, comments, subreddits, sentiment percentages, subscriber counts) "
+        "strictly in this live data. Never invent or hallucinate metrics.\n"
+        "   - FOR GENERAL STRATEGIC & CREATIVE QUESTIONS: (e.g. 'what type of videos get audiences hooked?', "
+        "'how to gain positive sentiment?', 'how to optimize CTR?', 'how to post on Reddit without being marked as spam?'): "
+        "Provide thorough, high-impact, expert strategic guidance using your playbook above! Break down concrete structures, "
+        "step-by-step frameworks, psychological triggers, and actionable steps.\n\n"
+        f"{playbooks.get(context, cross_platform_playbook)}\n\n"
+        "2. PRECISION & CONTEXT:\n"
+        "   - If the user is currently viewing a specific channel, subreddit, or video (indicated in the data below), "
+        "tailor insights directly to that active subject.\n"
+        "   - If a specific metric shows 'N/A' or 'not yet ingested', note it clearly and advise on next steps.\n"
+        "   - Keep answers structured with bold highlights, clean bullet points, or numbered steps. "
+        "Do not output raw asterisks without purpose; use clean, elegant markdown formatting.\n"
+        "   - Maintain conversation continuity across turns."
     )
 
     return (
-        f"{base_instructions.get(context, base_instructions['youtube'])}\n\n"
+        f"{base_instructions.get(context, base_instructions['cross-platform'])}\n\n"
         f"{rules}\n\n"
         f"=== LIVE DATA FROM DATABASE (fetched right now) ===\n"
         f"{live_data}\n"
         f"=== END OF LIVE DATA ===\n\n"
-        f"Use the above real data to answer the user's question."
+        f"Use both your expert domain knowledge and the real live data above to answer the user's question."
     )
 
 
@@ -526,8 +706,8 @@ async def chatbot_query(payload: ChatbotRequest) -> ChatbotResponse:
                 *history_msgs,
                 {"role": "user",   "content": payload.question},
             ],
-            temperature=0.4,
-            max_tokens=800,  # increased from 512 to avoid truncated answers
+            temperature=0.5,
+            max_tokens=2000,  # comprehensive strategic playbooks
         )
     except AuthenticationError:
         raise HTTPException(
