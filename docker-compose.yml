@@ -10,6 +10,7 @@ name: engageiq
 x-backend-env: &backend-env
   APP_ENV: ${APP_ENV:-development}
   DEBUG: ${DEBUG:-true}
+  PORT: 8000
   # PostgreSQL
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -97,6 +98,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *backend-env
+      START_CELERY_WORKER: "false"
     ports:
       - "8000:8000"
     networks:

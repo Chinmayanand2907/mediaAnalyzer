@@ -4,11 +4,24 @@
  * All API call functions live here so components never hard-code endpoints.
  * The Vite dev proxy (vite.config.js) forwards /api → http://localhost:8000
  * so no CORS issues in development.
+ *
+ * VITE_API_BASE should be set to the backend ROOT url (no trailing slash, no /api/v1).
+ * Examples:
+ *   - Production:  VITE_API_BASE=https://your-app.hf.space
+ *   - Local dev:   leave unset (Vite proxy handles /api → localhost:8000)
+ *
+ * The axios instance appends /api/v1 automatically via its baseURL.
+ * ChatBotPanel uses the same VITE_API_BASE to construct /api/v1/chatbot/query.
  */
 
 import axios from 'axios';
 
-const API_BASE = import.meta.env.VITE_API_BASE || '/api/v1';
+// Backend root URL (no path). In local dev this is empty so the Vite proxy
+// can rewrite /api/v1/... → http://localhost:8000/api/v1/...
+const BACKEND_ROOT = import.meta.env.VITE_API_BASE || '';
+
+// Full base URL for the axios instance — all endpoints are relative to /api/v1.
+const API_BASE = `${BACKEND_ROOT}/api/v1`;
 
 const api = axios.create({
   baseURL: API_BASE,

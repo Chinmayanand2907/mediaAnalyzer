@@ -304,8 +304,10 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
     try {
-      const base = import.meta.env.VITE_API_BASE || '';
-      const res = await fetch(`${base}/api/v1/chatbot/query`, {
+      // VITE_API_BASE is the backend ROOT (e.g. https://your-app.hf.space).
+      // We always append /api/v1/chatbot/query so it matches the axios client convention.
+      const backendRoot = import.meta.env.VITE_API_BASE || '';
+      const res = await fetch(`${backendRoot}/api/v1/chatbot/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,

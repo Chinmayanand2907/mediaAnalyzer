@@ -36,6 +36,14 @@ from app.core.config import get_settings
 # ─── Settings ────────────────────────────────────────────────────
 settings = get_settings()
 
+# ─── SSL connect_args ────────────────────────────────────────────
+# When DATABASE_URL is set (cloud provider like Neon.tech), asyncpg needs
+# ssl="require" passed via connect_args.  For local Docker postgres (no SSL)
+# we omit connect_args so asyncpg doesn't attempt TLS negotiation.
+_connect_args: dict = {}
+if settings.DATABASE_URL:
+    _connect_args = {"ssl": "require"}
+
 # ─── Async Engine ────────────────────────────────────────────────
 async_engine = create_async_engine(
     settings.POSTGRES_DSN,          # postgresql+asyncpg://…
@@ -44,6 +52,7 @@ async_engine = create_async_engine(
     pool_size=10,                   # default connection pool size
     max_overflow=20,                # burst connections above pool_size
     pool_pre_ping=True,             # verify connections before checkout
+    connect_args=_connect_args,     # SSL for cloud providers (e.g. Neon.tech)
 )
 
 # ─── Session Factory ─────────────────────────────────────────────

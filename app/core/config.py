@@ -11,7 +11,7 @@ Usage:
 """
 
 from functools import lru_cache
-from typing import Literal, List
+from typing import Literal, List, Optional
 
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,10 +35,29 @@ class Settings(BaseSettings):
     # ── CORS ────────────────────────────────────────────────
     ALLOWED_ORIGINS: List[str] = Field(
         default=["http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:3000", "http://127.0.0.1:5173"],
-        description="CORS allowed origins. Set via ALLOWED_ORIGINS env var as a JSON array.",
+        description=(
+            "CORS allowed origins. Set via ALLOWED_ORIGINS env var as a JSON array. "
+            "In production include your Vercel domain, e.g. "
+            '[\"https://your-app.vercel.app\"]'
+        ),
     )
 
     # ── PostgreSQL ───────────────────────────────────────────
+    # For hosted providers (Neon.tech, Supabase, etc.) you can supply the
+    # full connection string as DATABASE_URL and it will take precedence over
+    # the individual host/user/password components below.
+    # Expected format (asyncpg):
+    #   postgresql+asyncpg://user:pass@host/db?ssl=require
+    # Neon's default URL uses the plain postgres:// scheme — the computed
+    # property normalises it automatically.
+    DATABASE_URL: Optional[str] = Field(
+        default=None,
+        description=(
+            "Full async DSN (postgresql+asyncpg://...). "
+            "Takes precedence over POSTGRES_USER/PASSWORD/HOST/PORT/DB when set."
+        ),
+    )
+
     POSTGRES_USER: str = "analyzer"
     POSTGRES_PASSWORD: str = "changeme"
     POSTGRES_HOST: str = "localhost"
@@ -48,7 +67,25 @@ class Settings(BaseSettings):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def POSTGRES_DSN(self) -> str:
-        """Build the async PostgreSQL connection string."""
+        """Build the async PostgreSQL connection string.
+
+        If DATABASE_URL is set (e.g. from Neon.tech), normalise it to the
+        asyncpg dialect and return it directly.  Otherwise construct the DSN
+        from the individual POSTGRES_* fields.
+        """
+        if self.DATABASE_URL:
+            dsn = self.DATABASE_URL
+            # Neon provides postgres:// or postgresql:// — upgrade to asyncpg dialect.
+            if dsn.startswith("postgres://"):
+                dsn = dsn.replace("postgres://", "postgresql+asyncpg://", 1)
+            elif dsn.startswith("postgresql://"):
+                dsn = dsn.replace("postgresql://", "postgresql+asyncpg://", 1)
+            # asyncpg accepts ssl= in query params, not sslmode=
+            dsn = dsn.replace("sslmode=", "ssl=")
+            if "ssl=" not in dsn:
+                separator = "&" if "?" in dsn else "?"
+                dsn = f"{dsn}{separator}ssl=require"
+            return dsn
         return (
             f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
@@ -58,6 +95,21 @@ class Settings(BaseSettings):
     @property
     def POSTGRES_DSN_SYNC(self) -> str:
         """Synchronous DSN for Alembic migrations and ad-hoc scripts."""
+        if self.DATABASE_URL:
+            dsn = self.DATABASE_URL
+            if dsn.startswith("postgres://"):
+                dsn = dsn.replace("postgres://", "postgresql+psycopg://", 1)
+            elif dsn.startswith("postgresql://"):
+                dsn = dsn.replace("postgresql://", "postgresql+psycopg://", 1)
+            elif dsn.startswith("postgresql+asyncpg://"):
+                dsn = dsn.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
+            # psycopg expects sslmode=, not ssl=
+            if "ssl=" in dsn and "sslmode=" not in dsn:
+                dsn = dsn.replace("ssl=", "sslmode=")
+            if "sslmode=" not in dsn:
+                separator = "&" if "?" in dsn else "?"
+                dsn = f"{dsn}{separator}sslmode=require"
+            return dsn
         return (
             f"postgresql+psycopg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
