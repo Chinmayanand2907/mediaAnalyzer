@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Users, Hash, MessageSquare, Flame, RefreshCw, Layers, PlusCircle } from 'lucide-react';
 import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip, Cell, YAxis } from 'recharts';
 
 import { useAnalytics, clearAnalyticsCache } from '../hooks/useAnalytics';
+import { useSessionState } from '../hooks/useSessionState';
 import {
   fetchRedditSubreddits,
   fetchRedditSubreddit,
@@ -40,7 +41,8 @@ const KeywordTooltip = ({ active, payload }) => {
 };
 
 export default function RedditView({ onActiveChange }) {
-  const [selectedSub, setSelectedSub]     = useState(null);
+  // Persist selected subreddit across page reloads (sessionStorage — cleared on new tab)
+  const [selectedSub, setSelectedSub]     = useSessionState('rd:selectedSub', null);
   const [newSubInput, setNewSubInput]     = useState('');
   const [inputMode, setInputMode]         = useState(false);
   const [page, setPage]                   = useState(1);
@@ -82,19 +84,17 @@ export default function RedditView({ onActiveChange }) {
     { enabled: !!selectedSub }
   );
 
-  // Auto-select the first subreddit when data loads if none is selected
+  const onActiveChangeRef = useRef(onActiveChange);
   useEffect(() => {
-    if (!selectedSub && subreddits && subreddits.length > 0) {
-      setSelectedSub(subreddits[0].subreddit_name);
-    }
-  }, [subreddits, selectedSub]);
+    onActiveChangeRef.current = onActiveChange;
+  });
 
   // Notify parent of active subreddit change
   useEffect(() => {
     if (selectedSub) {
-      onActiveChange?.(selectedSub);
+      onActiveChangeRef.current?.(selectedSub);
     }
-  }, [selectedSub, onActiveChange]);
+  }, [selectedSub]);
 
   const handleIngest = async (subName) => {
     const rawTarget = subName || selectedSub;
@@ -170,6 +170,11 @@ export default function RedditView({ onActiveChange }) {
                     style={{ minWidth: 200 }}
                   >
                     <option value="">— Select a subreddit —</option>
+                    {selectedSub && !(subreddits ?? []).some((sub) => sub.subreddit_name === selectedSub) && (
+                      <option value={selectedSub}>
+                        r/{selectedSub}
+                      </option>
+                    )}
                     {(subreddits ?? []).map((sub) => (
                       <option key={sub.subreddit_name} value={sub.subreddit_name}>
                         r/{sub.subreddit_name}

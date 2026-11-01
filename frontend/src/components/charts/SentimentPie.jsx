@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 const COLORS = {
@@ -47,11 +48,15 @@ export default function SentimentPie({ data, loading, accent = 'var(--yt-primary
 
   if (!data) return null;
 
-  const chartData = [
-    { name: 'positive', value: data.positive },
-    { name: 'neutral',  value: data.neutral  },
-    { name: 'negative', value: data.negative },
-  ].filter((d) => d.value > 0);
+  const { positive, neutral, negative } = data;
+
+  // Memoize chart data so Recharts doesn't see a new prop reference on every
+  // render (which would trigger its internal store and cause an infinite loop).
+  const chartData = useMemo(() => [
+    { name: 'positive', value: positive },
+    { name: 'neutral',  value: neutral  },
+    { name: 'negative', value: negative },
+  ].filter((d) => d.value > 0), [positive, neutral, negative]);
 
   const dominant = data.dominant_label;
 
@@ -89,8 +94,8 @@ export default function SentimentPie({ data, loading, accent = 'var(--yt-primary
               <Cell key={entry.name} fill={COLORS[entry.name]} stroke="transparent" />
             ))}
           </Pie>
-          <Tooltip content={<CustomTooltip />} />
-          <Legend content={<CustomLegend />} />
+          <Tooltip content={CustomTooltip} />
+          <Legend content={CustomLegend} />
         </PieChart>
       </ResponsiveContainer>
 

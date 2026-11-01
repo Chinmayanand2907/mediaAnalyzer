@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Users, Eye, ThumbsUp, Video, RefreshCw, Play, PlusCircle } from 'lucide-react';
 
 import { useAnalytics, clearAnalyticsCache } from '../hooks/useAnalytics';
+import { useSessionState } from '../hooks/useSessionState';
 import {
   fetchYoutubeChannels,
   fetchYoutubeChannel,
@@ -28,7 +29,8 @@ function fmt(n) {
 }
 
 export default function YoutubeView({ onActiveChange }) {
-  const [selectedChannel, setSelectedChannel] = useState(null);
+  // Persist selected channel across page reloads (sessionStorage — cleared on new tab)
+  const [selectedChannel, setSelectedChannel] = useSessionState('yt:selectedChannel', null);
   const [newChannelInput, setNewChannelInput] = useState('');
   const [channelIdError, setChannelIdError]   = useState('');
   const [inputMode, setInputMode] = useState(false); // toggle between dropdown and text input
@@ -64,19 +66,17 @@ export default function YoutubeView({ onActiveChange }) {
     { enabled: !!selectedChannel }
   );
 
-  // Auto-select the first channel when data loads if none is selected
+  const onActiveChangeRef = useRef(onActiveChange);
   useEffect(() => {
-    if (!selectedChannel && channels && channels.length > 0) {
-      setSelectedChannel(channels[0].channel_id);
-    }
-  }, [channels, selectedChannel]);
+    onActiveChangeRef.current = onActiveChange;
+  });
 
   // Notify parent of active channel change
   useEffect(() => {
     if (selectedChannel) {
-      onActiveChange?.(selectedChannel);
+      onActiveChangeRef.current?.(selectedChannel);
     }
-  }, [selectedChannel, onActiveChange]);
+  }, [selectedChannel]);
 
   const handleIngest = async (channelId) => {
     const rawTarget = channelId || selectedChannel;
@@ -161,6 +161,11 @@ export default function YoutubeView({ onActiveChange }) {
                     style={{ minWidth: 200 }}
                   >
                     <option value="">— Select a channel —</option>
+                    {selectedChannel && !(channels ?? []).some((ch) => ch.channel_id === selectedChannel) && (
+                      <option value={selectedChannel}>
+                        {selectedChannel}
+                      </option>
+                    )}
                     {(channels ?? []).map((ch) => (
                       <option key={ch.channel_id} value={ch.channel_id}>
                         {ch.display_name || ch.channel_id}

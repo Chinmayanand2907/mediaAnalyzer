@@ -175,7 +175,7 @@ function FormattedMessage({ content }) {
   return <div style={{ wordBreak: 'break-word' }}>{elements}</div>;
 }
 
-function MessageBubble({ msg }) {
+function MessageBubble({ msg, streaming = false }) {
   const isUser = msg.role === 'user';
   return (
     <div
@@ -229,7 +229,9 @@ function MessageBubble({ msg }) {
         {isUser ? (
           <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{msg.content}</span>
         ) : (
-          <FormattedMessage content={msg.content} />
+          <span className={streaming && msg.content ? 'streaming-cursor' : undefined}>
+            <FormattedMessage content={msg.content} />
+          </span>
         )}
       </div>
     </div>
@@ -298,16 +300,21 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
 
     setInput('');
     setError('');
-    setMessages((prev) => [...prev, { role: 'user', content: question }]);
     setLoading(true);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000);
 
+    // Append user message + empty assistant placeholder in one state update
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', content: question },
+      { role: 'assistant', content: '' },
+    ]);
+
     try {
-      // VITE_API_BASE is the backend ROOT (e.g. https://your-app.hf.space).
-      // We always append /api/v1/chatbot/query so it matches the axios client convention.
       const backendRoot = import.meta.env.VITE_API_BASE || '';
-      const res = await fetch(`${backendRoot}/api/v1/chatbot/query`, {
+      const res = await fetch(`${backendRoot}/api/v1/chatbot/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -315,7 +322,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
           question,
           context: platform,
           active_item: activeItem || null,
-          // Last 6 messages (≈3 turns) for multi-turn context
+          // Last 6 messages (≈3 turns) for multi-turn context — exclude the empty placeholder
           history: messages.slice(-6).map((m) => ({ role: m.role, content: m.content })),
         }),
       });
@@ -328,9 +335,52 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
         throw new Error(detail || `Server error ${res.status}`);
       }
 
-      const data = await res.json();
-      setMessages((prev) => [...prev, { role: 'assistant', content: data.answer }]);
+      // Read the SSE stream token by token
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        // Each SSE line: "data: <token>\n\n"
+        const lines = chunk.split('\n');
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const token = line.slice(6); // strip "data: "
+          if (token === '[DONE]') break;
+          if (token.startsWith('[ERROR]')) {
+            throw new Error(token.slice(8));
+          }
+          // Unescape the newlines we escaped on the server side
+          accumulated += token.replace(/\\n/g, '\n');
+          // Stream into the last (assistant) placeholder message
+          setMessages((prev) => {
+            const next = [...prev];
+            next[next.length - 1] = { role: 'assistant', content: accumulated };
+            return next;
+          });
+        }
+      }
+
+      // Ensure placeholder has content if model returned nothing
+      if (!accumulated) {
+        setMessages((prev) => {
+          const next = [...prev];
+          next[next.length - 1] = { role: 'assistant', content: 'No response generated.' };
+          return next;
+        });
+      }
     } catch (err) {
+      // Remove the empty assistant placeholder on error so chat stays clean
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        return last?.role === 'assistant' && last?.content === ''
+          ? prev.slice(0, -1)
+          : prev;
+      });
       if (err?.name === 'AbortError') {
         setError('Chatbot timed out. Try a shorter question.');
       } else {
@@ -360,6 +410,19 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
         @keyframes panelSlide {
           from { opacity: 0; transform: translateY(20px) scale(0.97); }
           to   { opacity: 1; transform: translateY(0)   scale(1);    }
+        }
+        @keyframes blink {
+          0%, 100% { opacity: 1; }
+          50%       { opacity: 0; }
+        }
+        .streaming-cursor::after {
+          content: '▍';
+          display: inline-block;
+          margin-left: 2px;
+          animation: blink 0.8s step-start infinite;
+          color: var(--cx-primary, #06b6d4);
+          font-size: 0.85em;
+          vertical-align: baseline;
         }
       `}</style>
 
@@ -412,14 +475,30 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
               </div>
               <div style={{
                 fontSize: 11, color: meta.accent, fontWeight: 600,
-                display: 'flex', alignItems: 'center', gap: 4,
+                display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
               }}>
                 <span style={{
                   width: 6, height: 6, borderRadius: '50%',
                   background: meta.accent, display: 'inline-block',
                   boxShadow: `0 0 6px ${meta.accent}`,
                 }} />
-                {meta.emoji} {meta.label}
+                <span>{meta.emoji} {meta.label}</span>
+                {activeItem && (
+                  <span style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: '1px 6px',
+                    borderRadius: 6,
+                    background: 'rgba(255,255,255,0.08)',
+                    color: 'var(--text-secondary, #cbd5e1)',
+                    maxWidth: 140,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }} title={activeItem}>
+                    • {activeItem}
+                  </span>
+                )}
               </div>
             </div>
             <button
@@ -455,15 +534,23 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
                   {meta.label}
                 </div>
                 <div style={{ fontSize: 12, lineHeight: 1.6 }}>
-                  Ask me anything about your {platform === 'cross-platform' ? 'cross-platform' : platform} data.
-                  I'll give you strategic, data-informed insights.
+                  {activeItem ? (
+                    <>Focused on active {platform === 'cross-platform' ? 'video' : platform === 'reddit' ? 'subreddit' : 'channel'} <code style={{ color: meta.accent, padding: '1px 5px', background: 'rgba(255,255,255,0.06)', borderRadius: 4 }}>{activeItem}</code>. Ask about audience sentiment, reaction contrast, or strategy!</>
+                  ) : (
+                    <>Ask me anything about your {platform === 'cross-platform' ? 'cross-platform' : platform} data. I'll give you strategic, data-informed insights.</>
+                  )}
                 </div>
               </div>
             )}
             {messages.map((msg, i) => (
-              <MessageBubble key={i} msg={msg} />
+              <MessageBubble
+                key={i}
+                msg={msg}
+                streaming={loading && i === messages.length - 1 && msg.role === 'assistant'}
+              />
             ))}
-            {loading && <TypingIndicator />}
+            {/* Show typing dots only while loading AND the last assistant message is still empty */}
+            {loading && (messages.length === 0 || messages[messages.length - 1]?.role !== 'assistant' || messages[messages.length - 1]?.content === '') && <TypingIndicator />}
             {error && (
               <div style={{
                 padding: '10px 13px', borderRadius: 10, marginBottom: 10,
@@ -544,7 +631,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
             <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 6, textAlign: 'center' }}>
             <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
               <span style={{ width: 5, height: 5, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 4px #22c55e', display: 'inline-block' }} />
-              Live DB data · DeepSeek via River.ai · Enter to send
+              Live DB data · DeepSeek via River.ai · Streaming · Enter to send
             </span>
             </div>
           </div>

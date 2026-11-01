@@ -292,9 +292,24 @@ _TITLE_STOPWORDS: frozenset = frozenset({
     'video', 'about', 'why', 'can', 'will', 'just', 'best', 'top', 'new', 'vs', 'get', 'has',
     'its', 'my', 'our', 'their', 'all', 'by', 'be', 'was', 'were', 'it', 'he', 'she', 'they',
     'watch', 'youtube', 'reddit', 'i', 'me', 'we', 'are', 'so', 'but', 'if', 'up', 'out',
+    'than', 'then', 'think', 'thought', 'know', 'see', 'look', 'make', 'made', 'now', 'here',
+    'there', 'who', 'whom', 'which', 'when', 'where', 'some', 'any', 'like', 'good', 'bad',
+    'well', 'say', 'says', 'said', 'tell', 'tells', 'told',
 })
 # Known spam/bot subreddits to skip
 _SPAM_SUB_RE = re.compile(r'(autonewspaper|bot|moderator|spam|promos|autotldr)', re.I)
+
+# Known creator aliases and initialisms
+_KNOWN_CREATOR_ALIASES: Dict[str, List[str]] = {
+    "marques brownlee": ["mkbhd"],
+    "mkbhd": ["marques brownlee"],
+    "mrwhosetheboss": ["arun", "arun maini"],
+    "arun maini": ["mrwhosetheboss"],
+    "linus tech tips": ["ltt", "linus sebastian"],
+    "ltt": ["linus tech tips"],
+    "technical guruji": ["gaurav chaudhary"],
+    "tech burner": ["shlok srivastava"],
+}
 
 
 def _build_video_fingerprint(
@@ -350,15 +365,26 @@ def _build_video_fingerprint(
             if len(tok) >= 3 and tok not in creator_variants:
                 creator_variants.append(tok)
 
-    # Enhance creator variants using tags (captures aliases like 'MKBHD')
-    # Look for single-word tags >= 5 chars to avoid generic short tags like 'tech'
+    # Add known creator aliases (e.g. 'mkbhd' for Marques Brownlee, 'arun' for Mrwhosetheboss)
+    for alias in _KNOWN_CREATOR_ALIASES.get(clean_creator, []):
+        if alias not in creator_variants:
+            creator_variants.append(alias)
+
+    # Enhance creator variants using tags ONLY if the tag actually relates to the creator:
+    # 1. Never treat a word that appears in the video title as a creator name (e.g. 'iphone', 'apple', 'samsung')
+    # 2. Only accept if the tag overlaps with the creator's channel name or an alias
+    title_lower = title.lower()
     for tag in tags:
         clean_tag = tag.lower().strip()
-        if ' ' not in clean_tag and len(clean_tag) >= 5 and clean_tag.isalnum():
-            # Exclude common generic single-word tags
-            if clean_tag not in {"review", "unboxing", "vlog", "podcast", "shorts", "video"}:
-                if clean_tag not in creator_variants:
-                    creator_variants.append(clean_tag)
+        if not clean_tag or not clean_tag.isalnum() or len(clean_tag) < 3:
+            continue
+        # Skip tags present in the video title (they describe the product or topic, not creator)
+        if clean_tag in title_lower:
+            continue
+        # Only accept tags that share significant token overlap with the creator's name
+        if clean_creator and (clean_tag in clean_creator or clean_creator in clean_tag):
+            if clean_tag not in creator_variants:
+                creator_variants.append(clean_tag)
 
     # Extract distinctive topic words from video title
     raw_words = re.findall(r'[a-zA-Z]{3,}', title.lower())
@@ -608,6 +634,7 @@ async def _fetch_reddit_video_discussions(
             getattr(s, 'url', '') or '',
             getattr(s, 'selftext', '') or '',
             getattr(s, 'title', '') or '',
+            str(getattr(s, 'subreddit', '')) or '',
         ]
         if include_comments:
             try:
@@ -653,6 +680,7 @@ async def _fetch_reddit_video_discussions(
         url_queries = [
             f"url:youtu.be/{vid_id}",
             f"url:youtube.com/watch?v={vid_id}",
+            f"url:youtube.com/shorts/{vid_id}",
             vid_id,
         ]
         for q in url_queries:
@@ -1742,6 +1770,22 @@ async def get_video_engagement(
         disparity_note = f"Reddit discussion sentiment is {int(rd_sentiment.positive*100)}% positive ({rd_sentiment.sample_size} comments analyzed)."
 
     topics = _extract_topics_from_texts(discussion_bodies, top_n=6)
+
+    # Diagnostic trace for active analysis tracking
+    try:
+        import json as _json
+        with open("/tmp/last_analyzed_video.json", "w") as _f:
+            _json.dump({
+                "video_id": vid_id,
+                "url": canonical_yt_url,
+                "title": title or f"Video {vid_id}",
+                "channel": channel_title or "",
+                "views": views,
+                "reddit_posts_found": len(live_posts_by_id),
+                "analyzed_at": datetime.now(timezone.utc).isoformat(),
+            }, _f, indent=2)
+    except Exception:
+        pass
 
     return VideoCrossPlatformEngagementResponse(
         youtube_video_id=vid_id,

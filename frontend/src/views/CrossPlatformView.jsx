@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import {
   Search, Link as LinkIcon,
   Clock, Scale, MessageSquare, Sparkles, TrendingUp,
@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 
 import { useAnalytics } from '../hooks/useAnalytics';
+import { useSessionState } from '../hooks/useSessionState';
 import {
   fetchSharedVideos,
   fetchCrossPlatformSentiment,
@@ -33,13 +34,20 @@ function fmt(n) {
 
 export default function CrossPlatformView({ onActiveChange }) {
   // ── YouTube Video search / selection state ────────────────────────────
-  const [videoQuery, setVideoQuery] = useState('');
-  const [activeVideo, setActiveVideo] = useState('');
+  // Persisted in sessionStorage: retained across page reloads in the same tab,
+  // but starts fresh and empty when opening a new tab.
+  const [videoQuery, setVideoQuery] = useSessionState('cx:videoQuery', '');
+  const [activeVideo, setActiveVideo] = useSessionState('cx:activeVideo', '');
+
+  const onActiveChangeRef = useRef(onActiveChange);
+  useEffect(() => {
+    onActiveChangeRef.current = onActiveChange;
+  });
 
   // Notify parent of active video change
   useEffect(() => {
-    onActiveChange?.(activeVideo || null);
-  }, [activeVideo, onActiveChange]);
+    onActiveChangeRef.current?.(activeVideo || null);
+  }, [activeVideo]);
 
   // ── Global "Recently Tracked" videos — all DB-tracked videos ──────────
   const { data: globalTracked } = useAnalytics(
@@ -48,10 +56,12 @@ export default function CrossPlatformView({ onActiveChange }) {
     { cacheKey: 'global:recently-tracked' }
   );
 
-  // ── Session-analyzed videos: persisted in localStorage ───────────────
+  // ── Session-analyzed videos: persisted in sessionStorage (tab-scoped) ────
+  // sessionStorage is cleared when the tab is closed, so new tabs always
+  // start with an empty recently-analyzed list (fresh state).
   const [sessionVideos, setSessionVideos] = useState(() => {
     try {
-      return JSON.parse(localStorage.getItem('cx_recently_analyzed') || '[]');
+      return JSON.parse(sessionStorage.getItem('cx_recently_analyzed') || '[]');
     } catch { return []; }
   });
 
@@ -69,7 +79,7 @@ export default function CrossPlatformView({ onActiveChange }) {
     { enabled: !!activeVideo }
   );
 
-  // ── Record each successfully analyzed video into session + localStorage ──
+  // ── Record each successfully analyzed video into session + sessionStorage ──
   useEffect(() => {
     if (!videoEngagement || !activeVideo) return;
     const entry = {
@@ -78,11 +88,14 @@ export default function CrossPlatformView({ onActiveChange }) {
       youtube_url: videoEngagement.youtube_url || null,
     };
     setSessionVideos((prev) => {
+      if (prev.length > 0 && prev[0].youtube_video_id === entry.youtube_video_id && prev[0].youtube_title === entry.youtube_title) {
+        return prev;
+      }
       const filtered = prev.filter(
         (v) => v.youtube_video_id !== entry.youtube_video_id
       );
       const next = [entry, ...filtered].slice(0, 5);
-      try { localStorage.setItem('cx_recently_analyzed', JSON.stringify(next)); } catch { /* ignore */ }
+      try { sessionStorage.setItem('cx_recently_analyzed', JSON.stringify(next)); } catch { /* ignore */ }
       return next;
     });
   }, [videoEngagement, activeVideo]);

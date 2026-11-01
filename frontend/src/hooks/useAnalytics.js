@@ -7,16 +7,48 @@
  * - Cancels in-flight requests via AbortController when deps change or component unmounts.
  * - Exposes `refetch({ force: true })` for manual refresh (e.g. after triggering ingest).
  * - Stable deps comparison prevents redundant renders.
+ * - Session-scoped persistence: cache is written to sessionStorage so data survives a page
+ *   refresh within the same browser tab, but a brand-new tab always starts completely fresh.
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 
+const SESSION_CACHE_KEY = 'engageiq:analytics_cache';
+const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes cache TTL
+
 /**
  * Global In-Memory Analytics Cache.
  * Key: string -> Value: { data: any, timestamp: number }
+ *
+ * Rehydrated from sessionStorage on module load so that a page refresh within
+ * the same tab restores previously fetched data instantly.  A new tab (fresh
+ * sessionStorage) always begins with an empty cache, satisfying the
+ * "start fresh on new tab" requirement.
  */
-export const analyticsMemoryCache = new Map();
-const DEFAULT_TTL_MS = 10 * 60 * 1000; // 10 minutes cache TTL
+export const analyticsMemoryCache = (() => {
+  const map = new Map();
+  try {
+    const stored = sessionStorage.getItem(SESSION_CACHE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      for (const [k, v] of Object.entries(parsed)) {
+        map.set(k, v);
+      }
+    }
+  } catch { /* sessionStorage unavailable or corrupt — start fresh */ }
+  return map;
+})();
+
+/** Persist the current in-memory cache snapshot to sessionStorage. */
+function persistCacheToSession() {
+  try {
+    const obj = {};
+    for (const [k, v] of analyticsMemoryCache.entries()) {
+      obj[k] = v;
+    }
+    sessionStorage.setItem(SESSION_CACHE_KEY, JSON.stringify(obj));
+  } catch { /* quota exceeded or unavailable — silently skip */ }
+}
 
 /**
  * Generate a deterministic cache key based on function identifier & serialized deps.
@@ -32,18 +64,20 @@ function createCacheKey(fetchFn, deps, customKey) {
 }
 
 /**
- * Clears all or matching entries in the analytics memory cache.
+ * Clears all or matching entries in the analytics memory cache and
+ * synchronises the removal to sessionStorage.
  */
 export function clearAnalyticsCache(pattern) {
   if (!pattern) {
     analyticsMemoryCache.clear();
-    return;
-  }
-  for (const key of analyticsMemoryCache.keys()) {
-    if (key.includes(pattern)) {
-      analyticsMemoryCache.delete(key);
+  } else {
+    for (const key of analyticsMemoryCache.keys()) {
+      if (key.includes(pattern)) {
+        analyticsMemoryCache.delete(key);
+      }
     }
   }
+  persistCacheToSession();
 }
 
 export function useAnalytics(
@@ -122,6 +156,7 @@ export function useAnalytics(
       .then((result) => {
         if (currentKey && useCache && result !== undefined) {
           analyticsMemoryCache.set(currentKey, { data: result, timestamp: Date.now() });
+          persistCacheToSession();
         }
         setData(result);
         setLoading(false);

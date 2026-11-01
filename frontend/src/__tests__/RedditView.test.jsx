@@ -43,6 +43,7 @@ const mockComments = [
 describe('RedditView Component', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
   });
 
   it('renders subreddit list and displays engagement grids', async () => {

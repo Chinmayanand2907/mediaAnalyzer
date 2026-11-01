@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, Cell,
@@ -46,11 +47,11 @@ export default function EngagementBar({ data, loading }) {
   );
 
   // Build chart-friendly data: one entry per tracked account
-  const chartData = data.map((item) => ({
+  const chartData = useMemo(() => data.map((item) => ({
     name: item.raw_engagement?.display_name ?? item.raw_engagement?.account_id ?? 'Unknown',
     score: item.normalised_score,
     platform: item.platform,
-  }));
+  })), [data]);
 
   return (
     <ResponsiveContainer width="100%" height={260}>
@@ -69,7 +70,7 @@ export default function EngagementBar({ data, loading }) {
           domain={[0, 100]}
           tickFormatter={(v) => `${v}`}
         />
-        <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+        <Tooltip content={CustomTooltip} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
         <Legend
           formatter={(value) => <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{value}</span>}
         />

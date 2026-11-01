@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import {
   ResponsiveContainer,
   BarChart,
@@ -89,11 +90,13 @@ export default function CrossSentimentChart({ data, loading }) {
     ? { label: '~ Moderately Divergent', bg: 'rgba(245,158,11,0.14)', border: 'rgba(245,158,11,0.3)', color: '#f59e0b' }
     : { label: '⚠ Strongly Polarized',  bg: 'rgba(239,68,68,0.14)',  border: 'rgba(239,68,68,0.3)',  color: '#ef4444' };
 
-  const chartData = [
+  // Memoize chart data so Recharts doesn't see a new prop reference on every
+  // render (which would trigger its internal store and cause an infinite loop).
+  const chartData = useMemo(() => [
     { category: 'Positive', youtube: yt.positive || 0, reddit: rd.positive || 0 },
     { category: 'Neutral',  youtube: yt.neutral  || 0, reddit: rd.neutral  || 0 },
     { category: 'Negative', youtube: yt.negative || 0, reddit: rd.negative || 0 },
-  ];
+  ], [yt.positive, yt.neutral, yt.negative, rd.positive, rd.neutral, rd.negative]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -182,7 +185,7 @@ export default function CrossSentimentChart({ data, loading }) {
                 tickFormatter={(v) => `${(v * 100).toFixed(0)}%`}
                 domain={[0, 'auto']}
               />
-              <Tooltip content={<CustomTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
+              <Tooltip content={CustomTooltip} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
               <Legend
                 formatter={(value) => (
                   <span style={{ fontSize: 12, color: 'var(--text-secondary)', marginRight: 14 }}>

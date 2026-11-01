@@ -43,6 +43,7 @@ const mockComments = [
 describe('YoutubeView Component', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
   });
 
   it('renders channel list and fetches data on selection', async () => {

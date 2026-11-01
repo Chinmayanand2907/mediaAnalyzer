@@ -73,6 +73,7 @@ describe('CrossPlatformView Component', () => {
     vi.clearAllMocks();
     clearAnalyticsCache();
     localStorage.clear();
+    sessionStorage.clear();
     apiClient.fetchRedditSubreddits.mockResolvedValue([{ subreddit_name: 'gaming', display_name: 'Gaming' }]);
     apiClient.fetchSharedVideos.mockResolvedValue(mockSharedVideos);
     apiClient.fetchTopVideos.mockResolvedValue([]);
@@ -81,58 +82,59 @@ describe('CrossPlatformView Component', () => {
     apiClient.fetchVideoCrossPlatformEngagement.mockResolvedValue(null);
   });
 
-  // Helper: switch to Explore Subreddits mode and scan r/gaming so the
-  // subreddit-gated hooks (shared videos, sentiment) actually fetch.
-  async function scanGamingSubreddit(user) {
-    await act(async () => {
-      await user.click(screen.getByRole('button', { name: /Explore Subreddits/i }));
-    });
-    await act(async () => {
-      await user.type(screen.getByPlaceholderText(/gaming, askreddit/i), 'gaming');
-    });
-    await act(async () => {
-      await user.click(screen.getByRole('button', { name: /Scan/i }));
-    });
-    expect(await screen.findByText(/YouTube Videos Shared in r/i)).toBeInTheDocument();
-  }
+  const mockEngagement = {
+    youtube_video_id: 'dQw4w9WgXcQ',
+    youtube_url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
+    youtube_title: 'Never Gonna Give You Up',
+    youtube_channel_title: 'Rick Astley',
+    youtube_views: 1200000,
+    youtube_likes: 95000,
+    subreddits_count: 2,
+    subreddits_list: ['gaming', 'music'],
+    reddit_total_comments: 45,
+    reddit_total_upvotes: 250,
+    reddit_posts_count: 2,
+    propagation_speed: 'Rapid (< 6h)',
+    discussions: [
+      {
+        discussion_id: 'd1',
+        subreddit: 'gaming',
+        post_title: 'Check out this awesome track!',
+        author: 'GamerX',
+        score: 45,
+        num_comments: 2,
+        top_comments: [],
+      },
+    ],
+  };
 
-  it('renders updated KPI cards and the linked video table', async () => {
+  it('renders updated KPI cards and analyzes video on submission', async () => {
+    apiClient.fetchVideoCrossPlatformEngagement.mockResolvedValue(mockEngagement);
     const user = userEvent.setup();
     render(<CrossPlatformView />);
 
     expect(await screen.findByText('Cross-Platform Analysis')).toBeInTheDocument();
-    // Video mode (default) with no video entered: KPI cards render placeholders
+    // Video mode with no video entered: KPI cards render placeholders
     expect(screen.getByText('Subreddits Discussing')).toBeInTheDocument();
-    expect(screen.getByText('Reddit Discussions')).toBeInTheDocument();
+    expect(screen.getByText('Reddit Comments')).toBeInTheDocument();
     expect(screen.getByText('YouTube Reach')).toBeInTheDocument();
-    expect(screen.getByText('Viral Latency')).toBeInTheDocument();
+    expect(screen.getByText('Reddit Posts')).toBeInTheDocument();
 
-    // Linked-video table lives in Explore Subreddits mode after a scan
-    await scanGamingSubreddit(user);
-    expect((await screen.findAllByText(/Never Gonna Give You Up/i)).length).toBeGreaterThan(0);
-    expect(screen.getAllByText('Rick Astley').length).toBeGreaterThan(0);
+    // Analyze video
+    const input = screen.getByPlaceholderText(/e\.g\. https:\/\/youtu\.be/i);
+    await act(async () => {
+      await user.type(input, 'dQw4w9WgXcQ');
+      await user.click(screen.getByRole('button', { name: /Analyze Video/i }));
+    });
+
+    expect(await screen.findByText('Never Gonna Give You Up')).toBeInTheDocument();
+    expect(screen.getByText('Check out this awesome track!')).toBeInTheDocument();
   });
 
   it('shows sentiment comparison section', async () => {
     render(<CrossPlatformView />);
 
     expect(await screen.findByText('Audience Sentiment: YouTube vs Reddit')).toBeInTheDocument();
-    expect(screen.getByText(/Audience Response Contrast/i)).toBeInTheDocument();
-  });
-
-  it('expands discussion drawer on click', async () => {
-    const user = userEvent.setup();
-    render(<CrossPlatformView />);
-
-    // Table rows only render in Explore Subreddits mode after a scan
-    await scanGamingSubreddit(user);
-    const toggleBtn = await screen.findByRole('button', { name: /2/i });
-    await act(async () => {
-      await user.click(toggleBtn);
-    });
-
-    expect(await screen.findByText('Check out this awesome track!')).toBeInTheDocument();
-    expect(screen.getByText(/u\/GamerX/i)).toBeInTheDocument();
   });
 });
 

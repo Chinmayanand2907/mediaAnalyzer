@@ -25,40 +25,37 @@ vi.mock('../api/client', () => ({
   })),
   fetchCrossPlatformTopics: vi.fn(() => Promise.resolve({ shared_topics: [], youtube_topics: [], reddit_topics: [], top_correlations: [] })),
   fetchCorrelationSummary: vi.fn(() => Promise.resolve({})),
+  fetchVideoCrossPlatformEngagement: vi.fn(() => Promise.resolve(null)),
 }));
 
 
 describe('Dashboard Component', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    sessionStorage.clear();
   });
 
   it('renders YoutubeView by default and switches platforms correctly', async () => {
     const user = userEvent.setup();
     render(<Dashboard />);
 
-    // Assert: Check default view (YouTube)
-    expect(screen.getAllByText('YouTube Analytics').length).toBeGreaterThan(0);
-    expect(screen.queryByText('Reddit Insights')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'YouTube Analytics' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Reddit Insights' })).not.toBeInTheDocument();
 
-    // Act: Click the dropdown toggle in the Navbar
     const switchButton = screen.getByRole('button', { name: /switch platform/i });
     await act(async () => {
       await user.click(switchButton);
     });
 
-    // Act: Click 'Reddit Insights' from the dropdown
     const redditOption = screen.getAllByRole('button').find(btn => btn.textContent.includes('Reddit Insights'));
     expect(redditOption).toBeInTheDocument();
     await act(async () => {
       await user.click(redditOption);
     });
 
-    // Assert: Reddit view should be visible, YouTube hidden
-    expect(await screen.findByText(/Community engagement and keyword trends/i)).toBeInTheDocument();
-    expect(screen.queryByText('Sentiment intelligence across your tracked channels')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Reddit Insights' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'YouTube Analytics' })).not.toBeInTheDocument();
 
-    // Act: Switch to Cross-Platform
     await act(async () => {
       await user.click(screen.getByRole('button', { name: /switch platform/i }));
     });
@@ -67,7 +64,6 @@ describe('Dashboard Component', () => {
       await user.click(crossOption);
     });
 
-    // Assert: Cross-Platform view should be visible
-    expect(await screen.findByText(/Cross-Platform Analysis/i)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Cross-Platform Analysis' })).toBeInTheDocument();
   });
 });
