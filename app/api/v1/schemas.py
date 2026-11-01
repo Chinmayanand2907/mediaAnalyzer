@@ -36,7 +36,7 @@ class CommentSentimentItem(BaseModel):
     body: str
     published_at: Optional[str]
     sentiment_label: str
-    sentiment_score: float
+    sentiment_score: Optional[float] = None
     engine: str
 
 

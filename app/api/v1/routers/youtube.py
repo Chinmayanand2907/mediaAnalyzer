@@ -261,7 +261,7 @@ async def get_youtube_comments(
         .find(
             mongo_filter,
             {"_id": 0, "platform_id": 1, "author": 1, "body": 1,
-             "published_at": 1, "sentiment_label": 1},
+             "published_at": 1, "sentiment_label": 1, "sentiment_score": 1},
         )
         .sort("ingested_at", -1)
         .skip(skip)
@@ -289,7 +289,9 @@ async def get_youtube_comments(
     for i, doc in enumerate(docs):
         stored_label = doc.get("sentiment_label")
         if stored_label:
-            # Use the pre-computed label stored by the ingestion worker.
+            # Use the pre-computed label and score stored by the ingestion worker.
+            # Older docs ingested before score storage will have sentiment_score=None.
+            stored_score = doc.get("sentiment_score")
             items.append(
                 CommentSentimentItem(
                     comment_id=doc.get("platform_id", ""),
@@ -297,7 +299,7 @@ async def get_youtube_comments(
                     body=doc.get("body", ""),
                     published_at=doc.get("published_at"),
                     sentiment_label=stored_label,
-                    sentiment_score=0.0,
+                    sentiment_score=stored_score,
                     engine="stored",
                 )
             )

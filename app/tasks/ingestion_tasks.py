@@ -417,17 +417,23 @@ def _vader_compound_to_category(compound: float) -> str:
     return "neutral"
 
 
-def _run_roberta_batch(texts: list[str]) -> list[str]:
+def _run_roberta_batch(texts: list[str]) -> list[tuple[str, float]]:
     """
     Run texts through RoBERTa if the pipeline is pre-loaded, otherwise fall
     back to VADER so sentiment analysis never crashes.
+
+    Returns a list of (label, score) tuples where score is the model confidence
+    (0.0–1.0) for the predicted label.
     """
     # Try the pre-loaded pipeline from the worker_process_init signal
     try:
         from app.core.celery_app import _roberta_pipeline  # noqa: PLC0415
         if _roberta_pipeline is not None:
             results = _roberta_pipeline(texts, batch_size=32)
-            return [_roberta_label_to_category(r["label"]) for r in results]
+            return [
+                (_roberta_label_to_category(r["label"]), round(float(r["score"]), 4))
+                for r in results
+            ]
     except Exception:
         pass
 
@@ -436,19 +442,26 @@ def _run_roberta_batch(texts: list[str]) -> list[str]:
     return _run_vader_batch(texts)
 
 
-def _run_vader_batch(texts: list[str]) -> list[str]:
+def _run_vader_batch(texts: list[str]) -> list[tuple[str, float]]:
     """
     Run texts through VADER. Instantiated on-demand so it works even when
     worker_process_init hasn't pre-loaded a global analyzer.
+
+    Returns a list of (label, score) tuples where score is the absolute value
+    of the VADER compound score (0.0–1.0).
     """
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # noqa: PLC0415
     analyzer = SentimentIntensityAnalyzer()
 
-    categories = []
+    results = []
     for text in texts:
         scores = analyzer.polarity_scores(text)
-        categories.append(_vader_compound_to_category(scores["compound"]))
-    return categories
+        compound = scores["compound"]
+        label = _vader_compound_to_category(compound)
+        # Use abs(compound) as a 0–1 confidence proxy; neutral gets 1-abs for clarity
+        score = round(abs(compound), 4)
+        results.append((label, score))
+    return results
 
 
 async def _process_sentiment_async(platform: str, target_id: str) -> dict:
@@ -500,7 +513,9 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                 return
             b_ids = [d["_id"] for d in batch]
             b_texts = [d.get("body", "") or "" for d in batch]
-            b_cats = _run_roberta_batch(b_texts)
+            b_results = _run_roberta_batch(b_texts)  # list of (label, score) tuples
+            b_cats = [r[0] for r in b_results]
+            b_scores = [r[1] for r in b_results]
             all_doc_ids.extend(b_ids)
             all_categories.extend(b_cats)
             now_utc_b = datetime.now(timezone.utc)
@@ -511,9 +526,10 @@ async def _process_sentiment_async(platform: str, target_id: str) -> dict:
                         "sentiment_processed": True,
                         "sentiment_processed_at": now_utc_b,
                         "sentiment_label": category,
+                        "sentiment_score": score,
                     }},
                 )
-                for doc_id, category in zip(b_ids, b_cats)
+                for doc_id, category, score in zip(b_ids, b_cats, b_scores)
             ]
             if ops:
                 await comments_coll.bulk_write(ops, ordered=False)

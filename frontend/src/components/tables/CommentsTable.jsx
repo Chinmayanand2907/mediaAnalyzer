@@ -96,7 +96,9 @@ export default function CommentsTable({ comments, loading, page, onPageChange, o
                     </span>
                   </td>
                   <td style={{ fontVariantNumeric: 'tabular-nums', color: 'var(--text-secondary)' }}>
-                    {c.sentiment_score?.toFixed(3)}
+                    {(c.sentiment_score != null && !(c.engine === 'stored' && c.sentiment_score === 0))
+                      ? c.sentiment_score.toFixed(3)
+                      : '—'}
                   </td>
                   <td style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>
                     {c.engine}
