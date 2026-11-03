@@ -4,12 +4,12 @@ import {
   Tooltip, Legend, ResponsiveContainer, Cell,
 } from 'recharts';
 
-const PLATFORM_COLORS = { youtube: '#6366f1', reddit: '#f43f5e' };
+const PLATFORM_COLORS = { youtube: 'var(--yt-primary)', reddit: 'var(--rd-primary)' };
 
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
-    <div style={{ background: '#1e1e2e', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '10px 14px', fontSize: 13 }}>
+    <div className="chart-tooltip" style={{ background: '#ffffff', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '10px 14px', fontSize: 13 }}>
       <div style={{ color: 'var(--text-muted)', marginBottom: 6, fontSize: 11 }}>{label}</div>
       {payload.map((p) => (
         <div key={p.dataKey} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
@@ -56,7 +56,7 @@ export default function EngagementBar({ data, loading }) {
   return (
     <ResponsiveContainer width="100%" height={260}>
       <ComposedChart data={chartData} margin={{ top: 10, right: 10, left: -10, bottom: 0 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#e4e0d8" vertical={false} />
         <XAxis
           dataKey="name"
           tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
@@ -70,7 +70,7 @@ export default function EngagementBar({ data, loading }) {
           domain={[0, 100]}
           tickFormatter={(v) => `${v}`}
         />
-        <Tooltip content={CustomTooltip} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
+        <Tooltip content={CustomTooltip} cursor={{ fill: '#f1f0e9' }} />
         <Legend
           formatter={(value) => <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>{value}</span>}
         />
@@ -83,7 +83,7 @@ export default function EngagementBar({ data, loading }) {
           dataKey="score"
           name="Trend"
           type="monotone"
-          stroke="#06b6d4"
+          stroke="var(--cx-primary)"
           strokeWidth={2}
           dot={false}
           strokeDasharray="4 2"

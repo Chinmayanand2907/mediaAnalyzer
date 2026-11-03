@@ -36,7 +36,7 @@ export default function Dashboard() {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+    <div className="dashboard-shell" style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
       {/* ── Global Top Navigation ── */}
       <Navbar platform={platform} onPlatformChange={handlePlatformChange} />
 

@@ -2,16 +2,16 @@ import { useMemo } from 'react';
 import { PieChart, Pie, Cell, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 const COLORS = {
-  positive: '#22c55e',
-  neutral:  '#f59e0b',
-  negative: '#ef4444',
+  positive: '#1c9b72',
+  neutral:  '#a88328',
+  negative: '#b95d46',
 };
 
 const CustomTooltip = ({ active, payload }) => {
   if (!active || !payload?.length) return null;
   const { name, value } = payload[0];
   return (
-    <div className="custom-tooltip" style={{ background: '#1e1e2e', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '10px 14px', fontSize: 13 }}>
+    <div className="custom-tooltip chart-tooltip" style={{ background: '#ffffff', border: '1px solid var(--border-strong)', borderRadius: 8, padding: '10px 14px', fontSize: 13 }}>
       <span style={{ color: COLORS[name], fontWeight: 700, textTransform: 'capitalize' }}>{name}</span>
       <span style={{ color: 'var(--text-primary)', marginLeft: 8 }}>{(value * 100).toFixed(1)}%</span>
     </div>
@@ -19,7 +19,7 @@ const CustomTooltip = ({ active, payload }) => {
 };
 
 const CustomLegend = ({ payload }) => (
-  <div style={{ display: 'flex', gap: 20, justifyContent: 'center', marginTop: 12 }}>
+  <div className="chart-legend" style={{ display: 'flex', gap: 20, justifyContent: 'center', marginTop: 12 }}>
     {payload.map((entry) => (
       <div key={entry.value} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <div style={{ width: 10, height: 10, borderRadius: '50%', background: entry.color }} />

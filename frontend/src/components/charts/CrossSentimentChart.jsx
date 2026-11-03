@@ -14,13 +14,13 @@ import { Scale } from 'lucide-react';
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
-    <div style={{
-      background: '#1e1e2e',
+    <div className="chart-tooltip" style={{
+      background: '#ffffff',
       border: '1px solid var(--border-strong)',
       borderRadius: 8,
       padding: '10px 14px',
       fontSize: 13,
-      boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+      boxShadow: '0 8px 24px rgba(23,25,35,0.12)',
     }}>
       <div style={{ color: 'var(--text-muted)', marginBottom: 6, fontSize: 11, fontWeight: 700 }}>
         {label} Sentiment
@@ -85,10 +85,10 @@ export default function CrossSentimentChart({ data, loading }) {
 
   // ── Divergence classification ─────────────────────────────────────────────
   const divergence = absGap < 0.05
-    ? { label: '✓ Highly Aligned',       bg: 'rgba(34,197,94,0.14)',  border: 'rgba(34,197,94,0.3)',  color: '#22c55e' }
+    ? { label: '✓ Highly Aligned',       bg: '#e5f5ee',  border: '#b8dfcf',  color: '#187b5d' }
     : absGap < 0.20
-    ? { label: '~ Moderately Divergent', bg: 'rgba(245,158,11,0.14)', border: 'rgba(245,158,11,0.3)', color: '#f59e0b' }
-    : { label: '⚠ Strongly Polarized',  bg: 'rgba(239,68,68,0.14)',  border: 'rgba(239,68,68,0.3)',  color: '#ef4444' };
+    ? { label: '~ Moderately Divergent', bg: '#f7f0d9', border: '#e8d99e', color: '#876d20' }
+    : { label: '⚠ Strongly Polarized',  bg: '#f8e9e3',  border: '#e9c3b6', color: '#a64e3c' };
 
   // Memoize chart data so Recharts doesn't see a new prop reference on every
   // render (which would trigger its internal store and cause an infinite loop).
@@ -171,7 +171,7 @@ export default function CrossSentimentChart({ data, loading }) {
         <div style={{ height: 260, width: '100%' }}>
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={chartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+              <CartesianGrid strokeDasharray="3 3" stroke="#e4e0d8" vertical={false} />
               <XAxis
                 dataKey="category"
                 tick={{ fill: 'var(--text-muted)', fontSize: 12 }}

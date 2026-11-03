@@ -144,7 +144,7 @@ export default function RedditView({ onActiveChange }) {
   };
 
   return (
-    <div className="fade-up" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+    <div className="fade-up dashboard-view dashboard-view-reddit" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       
       {/* ── Header row ──────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>

@@ -8,13 +8,13 @@ const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   const extra = payload[0]?.payload;
   return (
-    <div style={{
-      background: '#1e1e2e',
+    <div className="chart-tooltip" style={{
+      background: '#ffffff',
       border: '1px solid var(--border-strong)',
       borderRadius: 8,
       padding: '10px 14px',
       fontSize: 13,
-      boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+      boxShadow: '0 8px 24px rgba(23,25,35,0.12)',
     }}>
       <div style={{ color: 'var(--text-primary)', fontWeight: 700, marginBottom: 6, fontSize: 12 }}>
         {extra?.fullTitle || label}
@@ -78,7 +78,7 @@ export default function TimelineChart({ data, loading }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       <ResponsiveContainer width="100%" height={280}>
         <LineChart data={data} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-          <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+          <CartesianGrid strokeDasharray="3 3" stroke="#e4e0d8" vertical={false} />
           <XAxis
             dataKey="label"
             tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
@@ -113,9 +113,9 @@ export default function TimelineChart({ data, loading }) {
             type="monotone"
             dataKey="youtube_views"
             name="YouTube Views"
-            stroke="#6366f1"
+            stroke="var(--yt-primary)"
             strokeWidth={2.5}
-            dot={{ r: 4, fill: '#6366f1', stroke: '#08080f', strokeWidth: 2 }}
+            dot={{ r: 4, fill: 'var(--yt-primary)', stroke: '#f7f7f2', strokeWidth: 2 }}
             activeDot={{ r: 6 }}
             animationDuration={800}
           />
@@ -124,9 +124,9 @@ export default function TimelineChart({ data, loading }) {
             type="monotone"
             dataKey="reddit_comments"
             name="Reddit Discussion Comments"
-            stroke="#f43f5e"
+            stroke="var(--rd-primary)"
             strokeWidth={2.5}
-            dot={{ r: 4, fill: '#f43f5e', stroke: '#08080f', strokeWidth: 2 }}
+            dot={{ r: 4, fill: 'var(--rd-primary)', stroke: '#f7f7f2', strokeWidth: 2 }}
             activeDot={{ r: 6 }}
             animationDuration={800}
             animationBegin={200}

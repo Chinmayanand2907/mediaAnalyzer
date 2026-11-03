@@ -5,21 +5,21 @@ const CONTEXT_META = {
   youtube: {
     label: 'YouTube Analyst',
     accent: 'var(--yt-primary)',
-    glow: 'rgba(99,102,241,0.35)',
+    glow: 'rgba(117,101,232,0.16)',
     placeholder: 'Ask about views, sentiment, subscribers…',
     emoji: '📺',
   },
   reddit: {
     label: 'Reddit Specialist',
     accent: 'var(--rd-primary)',
-    glow: 'rgba(244,63,94,0.35)',
+    glow: 'rgba(185,93,70,0.14)',
     placeholder: 'Ask about upvotes, keywords, community trends…',
     emoji: '🔥',
   },
   'cross-platform': {
     label: 'Cross-Channel Strategist',
     accent: 'var(--cx-primary)',
-    glow: 'rgba(6,182,212,0.35)',
+    glow: 'rgba(117,101,232,0.16)',
     placeholder: 'Ask about content propagation, dual-platform strategy…',
     emoji: '🔗',
   },
@@ -47,6 +47,7 @@ function parseInline(text) {
       parts.push(
         <code
           key={match.index}
+          className="chat-markdown-list"
           style={{
             background: 'rgba(255,255,255,0.1)',
             padding: '2px 6px',
@@ -112,6 +113,7 @@ function FormattedMessage({ content }) {
       flushList();
       elements.push(
         <h4
+          className="chat-markdown-heading"
           key={idx}
           style={{
             fontSize: 13.5,
@@ -127,6 +129,7 @@ function FormattedMessage({ content }) {
       flushList();
       elements.push(
         <h3
+          className="chat-markdown-heading"
           key={idx}
           style={{
             fontSize: 14.5,
@@ -142,6 +145,7 @@ function FormattedMessage({ content }) {
       flushList();
       elements.push(
         <h2
+          className="chat-markdown-heading"
           key={idx}
           style={{
             fontSize: 15.5,
@@ -163,7 +167,7 @@ function FormattedMessage({ content }) {
     } else {
       flushList();
       elements.push(
-        <p key={idx} style={{ margin: '3px 0', lineHeight: 1.55 }}>
+        <p key={idx} className="chat-markdown-paragraph" style={{ margin: '3px 0', lineHeight: 1.55 }}>
           {parseInline(line)}
         </p>
       );
@@ -172,13 +176,14 @@ function FormattedMessage({ content }) {
 
   flushList();
 
-  return <div style={{ wordBreak: 'break-word' }}>{elements}</div>;
+  return <div className="chat-markdown" style={{ wordBreak: 'break-word' }}>{elements}</div>;
 }
 
 function MessageBubble({ msg, streaming = false }) {
   const isUser = msg.role === 'user';
   return (
     <div
+      className={`chat-message ${isUser ? 'chat-message-user' : 'chat-message-assistant'}`}
       style={{
         display: 'flex',
         flexDirection: isUser ? 'row-reverse' : 'row',
@@ -190,6 +195,7 @@ function MessageBubble({ msg, streaming = false }) {
     >
       {/* Avatar */}
       <div
+        className="chat-avatar"
         style={{
           flexShrink: 0,
           width: 28,
@@ -213,6 +219,7 @@ function MessageBubble({ msg, streaming = false }) {
 
       {/* Bubble */}
       <div
+        className="chat-bubble"
         style={{
           maxWidth: '82%',
           padding: '10px 14px',
@@ -240,15 +247,15 @@ function MessageBubble({ msg, streaming = false }) {
 
 function TypingIndicator() {
   return (
-    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12 }}>
-      <div style={{
+    <div className="chat-typing" style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 12 }}>
+      <div className="chat-avatar" style={{
         flexShrink: 0, width: 28, height: 28, borderRadius: '50%',
         background: 'linear-gradient(135deg, #6366f1, #06b6d4)',
         display: 'flex', alignItems: 'center', justifyContent: 'center',
       }}>
         <Bot size={13} color="#fff" />
       </div>
-      <div style={{
+      <div className="chat-typing-bubble" style={{
         padding: '10px 14px',
         borderRadius: '4px 14px 14px 14px',
         background: 'rgba(99,102,241,0.12)',
@@ -429,6 +436,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
       {/* ── Floating Chat Panel ── */}
       {open && (
         <div
+          className="chat-panel"
           style={{
             position: 'fixed',
             bottom: 90,
@@ -447,14 +455,14 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
           }}
         >
           {/* Header */}
-          <div style={{
+          <div className="chat-header" style={{
             display: 'flex', alignItems: 'center', gap: 10,
             padding: '14px 16px',
             borderBottom: '1px solid var(--border)',
             background: 'rgba(255,255,255,0.02)',
             flexShrink: 0,
           }}>
-            <div style={{
+            <div className="chat-header-mark" style={{
               width: 34, height: 34, borderRadius: 10,
               background: 'linear-gradient(135deg, #6366f1, #06b6d4)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -521,9 +529,9 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
           </div>
 
           {/* Message Area */}
-          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 14px' }}>
+          <div className="chat-message-area" style={{ flex: 1, overflowY: 'auto', padding: '16px 14px' }}>
             {messages.length === 0 && (
-              <div style={{
+              <div className="chat-empty-state" style={{
                 height: '100%', display: 'flex', flexDirection: 'column',
                 alignItems: 'center', justifyContent: 'center',
                 color: 'var(--text-muted)', textAlign: 'center',
@@ -564,13 +572,13 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
           </div>
 
           {/* Input Area */}
-          <div style={{
+          <div className="chat-input-area" style={{
             padding: '12px 12px 14px',
             borderTop: '1px solid var(--border)',
             background: 'rgba(255,255,255,0.02)',
             flexShrink: 0,
           }}>
-            <div style={{
+            <div className="chat-input-shell" style={{
               display: 'flex', gap: 8,
               background: 'rgba(255,255,255,0.05)',
               border: `1px solid ${input ? meta.accent + '55' : 'var(--border-strong)'}`,
@@ -579,6 +587,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
               transition: 'border-color 0.2s',
             }}>
               <textarea
+                className="chat-input"
                 ref={inputRef}
                 rows={1}
                 value={input}
@@ -605,6 +614,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
                 }}
               />
               <button
+                className="chat-send-button"
                 onClick={sendMessage}
                 disabled={!input.trim() || loading}
                 style={{
@@ -640,6 +650,7 @@ export default function ChatBotPanel({ platform, activeItem = null }) {
 
       {/* ── Toggle FAB Button ── */}
       <button
+        className="chat-fab"
         onClick={() => setOpen((o) => !o)}
         title="Open AI Analyst"
         style={{

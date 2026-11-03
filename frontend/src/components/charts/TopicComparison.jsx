@@ -44,8 +44,8 @@ export default function TopicComparison({ data, loading }) {
                   gap: 6,
                   padding: '5px 12px',
                   borderRadius: 20,
-                  background: 'linear-gradient(135deg, rgba(6,182,212,0.2), rgba(99,102,241,0.2))',
-                  border: '1px solid rgba(6,182,212,0.4)',
+                  background: 'var(--soft-lavender)',
+                  border: '1px solid rgba(117,101,232,0.25)',
                   color: 'var(--text-primary)',
                   fontSize: 12,
                   fontWeight: 600,
@@ -83,8 +83,8 @@ export default function TopicComparison({ data, loading }) {
                   style={{
                     padding: '4px 10px',
                     borderRadius: 16,
-                    background: 'rgba(99,102,241,0.1)',
-                    border: '1px solid rgba(99,102,241,0.2)',
+                    background: 'var(--soft-lavender)',
+                    border: '1px solid rgba(117,101,232,0.25)',
                     color: 'var(--yt-primary)',
                     fontSize: 12,
                   }}
@@ -119,9 +119,9 @@ export default function TopicComparison({ data, loading }) {
                   style={{
                     padding: '4px 10px',
                     borderRadius: 16,
-                    background: 'rgba(244,63,94,0.1)',
-                    border: '1px solid rgba(244,63,94,0.2)',
-                    color: 'var(--rd-primary)',
+                    background: '#f8e9e3',
+                    border: '1px solid #e9c3b6',
+                    color: '#a64e3c',
                     fontSize: 12,
                   }}
                 >

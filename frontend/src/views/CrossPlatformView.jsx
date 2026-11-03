@@ -217,7 +217,7 @@ export default function CrossPlatformView({ onActiveChange }) {
     : 'Select a video above to see reach';
 
   return (
-    <div className="fade-up" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+    <div className="fade-up dashboard-view dashboard-view-cross" style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
 
       {/* ── Header ──────────────────────────────────────────────────────── */}
       <div>

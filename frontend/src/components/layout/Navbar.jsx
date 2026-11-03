@@ -22,9 +22,9 @@ export default function Navbar({ platform, onPlatformChange }) {
   return (
     <nav
       style={{
-        background: 'rgba(8,8,15,0.85)',
+        background: 'rgba(247,247,242,0.94)',
         borderBottom: '1px solid var(--border)',
-        backdropFilter: 'blur(20px)',
+        backdropFilter: 'blur(12px)',
         position: 'sticky',
         top: 0,
         zIndex: 50,
@@ -36,9 +36,9 @@ export default function Navbar({ platform, onPlatformChange }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <div style={{
             width: 34, height: 34, borderRadius: 10,
-            background: 'linear-gradient(135deg, #6366f1, #06b6d4)',
+            background: '#171923',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: '0 0 16px rgba(99,102,241,0.4)',
+            boxShadow: 'none',
           }}>
             <Zap size={18} color="#fff" strokeWidth={2.5} />
           </div>
@@ -68,7 +68,7 @@ export default function Navbar({ platform, onPlatformChange }) {
             style={{
               display: 'flex', alignItems: 'center', gap: 8,
               padding: '8px 14px',
-              background: 'rgba(255,255,255,0.05)',
+              background: '#ffffff',
               border: `1px solid ${open ? active.accent : 'var(--border-strong)'}`,
               borderRadius: 10,
               color: 'var(--text-primary)',
@@ -91,10 +91,10 @@ export default function Navbar({ platform, onPlatformChange }) {
             <div style={{
               position: 'absolute', right: 0, top: 'calc(100% + 8px)',
               minWidth: 230,
-              background: '#12121f',
+              background: '#fffefa',
               border: '1px solid var(--border-strong)',
               borderRadius: 12,
-              boxShadow: '0 20px 48px rgba(0,0,0,0.6)',
+              boxShadow: '0 16px 36px rgba(23,25,35,0.16)',
               overflow: 'hidden',
               animation: 'fadeUp 0.15s ease',
               zIndex: 100,
@@ -110,7 +110,9 @@ export default function Navbar({ platform, onPlatformChange }) {
                       width: '100%', textAlign: 'left',
                       display: 'flex', alignItems: 'center', gap: 12,
                       padding: '12px 16px',
-                      background: isActive ? `${p.accent}18` : 'transparent',
+                      background: isActive
+                        ? (p.value === 'reddit' ? 'rgba(185,93,70,0.10)' : 'rgba(117,101,232,0.10)')
+                        : 'transparent',
                       border: 'none',
                       borderLeft: isActive ? `3px solid ${p.accent}` : '3px solid transparent',
                       color: isActive ? p.accent : 'var(--text-secondary)',
@@ -118,7 +120,7 @@ export default function Navbar({ platform, onPlatformChange }) {
                       cursor: 'pointer',
                       transition: 'all 0.15s',
                     }}
-                    onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'rgba(255,255,255,0.04)'; }}
+                    onMouseEnter={(e) => { if (!isActive) e.currentTarget.style.background = 'rgba(117,101,232,0.06)'; }}
                     onMouseLeave={(e) => { if (!isActive) e.currentTarget.style.background = 'transparent'; }}
                   >
                     <PIcon size={16} color={p.accent} />
